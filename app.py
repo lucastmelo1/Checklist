@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, date
 import pandas as pd
+import os
+import json
+import tempfile
 import streamlit as st
 
 from auth import validate_user
@@ -16,7 +19,37 @@ from sheets_client import (
 # =========================
 # CONFIG FIXA (SEUS LINKS)
 # =========================
-CREDENTIALS_PATH = "credentials.json"
+CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_credentials_file() -> str:
+    """Retorna um caminho de credencial válido.
+    - Local: usa credentials.json (ou GOOGLE_APPLICATION_CREDENTIALS)
+    - Streamlit Cloud: usa st.secrets['gcp_service_account'] (grava em arquivo temporário)
+    """
+    # 1) Credencial local (desenvolvimento / rede interna)
+    if os.path.exists(CREDENTIALS_PATH):
+        return CREDENTIALS_PATH
+
+    # 2) Credencial via Secrets (produção)
+    try:
+        sa = st.secrets.get("gcp_service_account", None)
+    except Exception:
+        sa = None
+
+    if sa:
+        # grava 1x e reutiliza (cache_resource)
+        fd, path = tempfile.mkstemp(prefix="gcp-sa-", suffix=".json")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sa, f)
+        return path
+
+    raise FileNotFoundError(
+        f"Credenciais não encontradas. Esperado arquivo em '{CREDENTIALS_PATH}' "
+        "ou st.secrets['gcp_service_account'] configurado."
+    )
 
 LOGS_SHEET_ID   = "1h17A7dmYb6l3CXKRqOminzlH9rB9zTyBacqJ-DObHGQ"
 REGRAS_SHEET_ID = "1CjeDfGgKZBGkEseDc_JxbI5DxEsPvSMGXIv4SV0Qg_0"
@@ -128,7 +161,7 @@ def ensure_logs(service):
 def get_service_cached():
     """Google API service nao deve ser retornado pelo cache_data (nao e serializavel).
     Use cache_resource para manter um singleton seguro."""
-    return get_service(CREDENTIALS_PATH)
+    return get_service(ensure_credentials_file())
 
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -598,7 +631,7 @@ def main():
 
         st.divider()
         st.caption("Credenciais e acesso")
-        st.code(get_client_email(CREDENTIALS_PATH) or "(client_email indisponivel)")
+        st.code("" or "(client_email indisponivel)")
 
         if st.session_state.auth:
             st.caption(f"Logado: {st.session_state.user['nome']} ({st.session_state.user['login']})")
