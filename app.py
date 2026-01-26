@@ -23,10 +23,10 @@ CONFIG_SHEET_ID = _get_cfg("CONFIG_SHEET_ID", "")
 RULES_SHEET_ID = _get_cfg("RULES_SHEET_ID", "")
 LOGS_SHEET_ID = _get_cfg("LOGS_SHEET_ID", "")
 
-WS_AREAS_CANDIDATES = ["AREAS", "Areas", "Checklist_Areas", "CHECKLIST_AREAS"]
-WS_ITENS_CANDIDATES = ["ITENS", "Itens", "Checklist_Itens", "CHECKLIST_ITENS"]
-WS_USERS_CANDIDATES = ["USUARIOS", "Usuarios", "USERS", "Users", "LOGIN", "Login"]
-WS_LOGS_CANDIDATES = ["LOGS", "Logs", "CHECKLIST_LOGS", "Checklist_Logs"]
+WS_AREAS_CANDIDATES = ["Areas", "AREAS", "Checklist_Areas", "CHECKLIST_AREAS"]
+WS_ITENS_CANDIDATES = ["Itens", "ITENS", "Checklist_Itens", "CHECKLIST_ITENS"]
+WS_USERS_CANDIDATES = ["Users", "USERS", "Usuarios", "USUARIOS", "Login", "LOGIN"]
+WS_LOGS_CANDIDATES = ["Checklist_Logs", "CHECKLIST_LOGS", "Logs", "LOGS"]
 
 COL_AREA = "area"
 COL_TURNO = "turno"
@@ -34,8 +34,8 @@ COL_ITEM_ID = "item_id"
 COL_TEXTO = "texto"
 COL_ATIVO = "ativo"
 COL_ORDEM = "ordem"
-COL_DEADLINE = "deadline"
-COL_TOL_MIN = "tolerancia_min"
+COL_DEADLINE = "deadline"          # HH:MM
+COL_TOL_MIN = "tolerancia_min"     # minutos
 COL_DIA_SEMANA = "dia_semana"
 
 LOG_COLS = [
@@ -99,18 +99,19 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def service_client():
     return get_service_cached()
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=5)
 def load_tables(cache_buster: str, config_sheet_id: str, rules_sheet_id: str, logs_sheet_id: str):
     svc = service_client()
 
     if not config_sheet_id or not rules_sheet_id or not logs_sheet_id:
         raise RuntimeError(
-            "IDs das planilhas não configurados. Defina CONFIG_SHEET_ID, RULES_SHEET_ID e LOGS_SHEET_ID em Secrets [app]."
+            "IDs das planilhas não configurados. Defina CONFIG_SHEET_ID, RULES_SHEET_ID, LOGS_SHEET_ID "
+            "em Streamlit Secrets [app]."
         )
 
     ws_areas = pick_existing_tab(svc, config_sheet_id, WS_AREAS_CANDIDATES)
@@ -143,6 +144,10 @@ def _validate_itens_columns(itens_df: pd.DataFrame):
             f"A aba ITENS precisa ter as colunas: {sorted(list(needed))}. "
             f"Faltando: {missing}. Colunas atuais: {list(itens_df.columns)}"
         )
+    if COL_DEADLINE not in itens_df.columns:
+        st.warning("A aba ITENS não tem a coluna 'deadline' (HH:MM). Sem alerta de atraso.")
+    if COL_TOL_MIN not in itens_df.columns:
+        st.warning("A aba ITENS não tem a coluna 'tolerancia_min'. Tolerância padrão será 0.")
 
 
 def _available_areas(areas_df: pd.DataFrame, itens_df: pd.DataFrame) -> list[str]:
@@ -162,6 +167,7 @@ def _filter_items_for(itens_df: pd.DataFrame, area: str, turno: str, dia_semana:
     df = itens_df.copy()
     df[COL_AREA] = df[COL_AREA].astype(str).str.strip()
     df[COL_TURNO] = df[COL_TURNO].astype(str).str.strip()
+
     df = df[(df[COL_AREA] == area) & (df[COL_TURNO] == turno)]
 
     if COL_ATIVO in df.columns:
@@ -185,7 +191,7 @@ def _filter_items_for(itens_df: pd.DataFrame, area: str, turno: str, dia_semana:
     return df.reset_index(drop=True)
 
 
-def _parse_deadline_today(deadline_str: str):
+def _parse_deadline_today(deadline_str: str) -> datetime | None:
     if not deadline_str or str(deadline_str).strip() == "" or str(deadline_str).lower() == "nan":
         return None
     s = str(deadline_str).strip()
@@ -210,11 +216,14 @@ def _latest_status_map(logs_df: pd.DataFrame):
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
     df = df.dropna(subset=["ts"])
 
-    for k in ["data", "area", "turno", "item_id"]:
-        df[k] = df[k].astype(str).str.strip()
+    df["data"] = df["data"].astype(str).str.strip()
+    df["area"] = df["area"].astype(str).str.strip()
+    df["turno"] = df["turno"].astype(str).str.strip()
+    df["item_id"] = df["item_id"].astype(str).str.strip()
 
     df = df.sort_values("ts")
     latest = df.groupby(["data", "area", "turno", "item_id"], as_index=False).tail(1)
+
     mp = {}
     for _, r in latest.iterrows():
         mp[(r["data"], r["area"], r["turno"], r["item_id"])] = str(r["status"]).strip()
@@ -249,20 +258,15 @@ def _write_log(area: str, turno: str, item_id: str, texto: str, status: str, use
 
 def page_dashboard(tables, dia_str: str):
     st.subheader("Dashboard operacional")
+    st.caption("Atualização automática a cada 6 segundos. Você pode desligar.")
 
     st.session_state.setdefault("auto_refresh_sec", 6)
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.session_state["auto_refresh_sec"] = st.number_input(
-            "Auto refresh (segundos)",
-            min_value=0, max_value=60,
-            value=int(st.session_state["auto_refresh_sec"]),
-            step=1
-        )
-    with c2:
-        if st.button("Atualizar agora"):
-            _invalidate_cache()
-            st.rerun()
+    sec = st.number_input("Auto refresh (segundos)", 0, 60, int(st.session_state["auto_refresh_sec"]), 1)
+    st.session_state["auto_refresh_sec"] = int(sec)
+
+    if st.button("Atualizar agora"):
+        _invalidate_cache()
+        st.rerun()
 
     if st.session_state["auto_refresh_sec"] > 0:
         st.session_state.setdefault("_last_refresh", time.time())
@@ -279,8 +283,8 @@ def page_dashboard(tables, dia_str: str):
 
     areas = _available_areas(areas_df, itens_df)
     turnos = _available_turnos(itens_df)
-
     status_map = _latest_status_map(logs_df)
+
     now = _now_ts()
     today = now.date().isoformat()
 
@@ -292,7 +296,7 @@ def page_dashboard(tables, dia_str: str):
             items = _filter_items_for(itens_df, area, turno, dia_str)
             total = len(items)
             done = 0
-            overdue = False
+            has_overdue = False
 
             for _, it in items.iterrows():
                 item_id = str(it[COL_ITEM_ID]).strip()
@@ -300,14 +304,17 @@ def page_dashboard(tables, dia_str: str):
                 if stt == "OK":
                     done += 1
 
-                dl = _parse_deadline_today(str(it.get(COL_DEADLINE, "") or "").strip())
+                dl_dt = _parse_deadline_today(str(it.get(COL_DEADLINE, "") or ""))
                 tol = int(it.get(COL_TOL_MIN, 0) or 0)
-                if dl is not None and stt != "OK" and now > (dl + pd.Timedelta(minutes=tol)):
-                    overdue = True
+                if dl_dt is not None and stt != "OK":
+                    if now > (dl_dt + pd.Timedelta(minutes=tol)):
+                        has_overdue = True
 
             pct = (done / total) if total else 0.0
-            color = "#0b6a5a" if pct >= 0.999 else ("#7a1f2b" if overdue else "#2b2b2b")
             subtitle = f"{done}/{total} concluídos" if total else "Sem itens"
+
+            color = "#0b6a5a" if pct >= 0.999 else ("#7a1f2b" if has_overdue else ("#8b6b12" if pct > 0 else "#2b2b2b"))
+            pct_txt = f"{int(round(pct * 100, 0))}%"
 
             with cols[idx % len(cols)]:
                 st.markdown(
@@ -315,46 +322,34 @@ def page_dashboard(tables, dia_str: str):
                     <div style="border-radius:16px;padding:14px;margin:8px 0;background:{color};color:white;">
                       <div style="font-size:16px;font-weight:700;">{turno}</div>
                       <div style="font-size:13px;opacity:0.9;margin-top:4px;">{subtitle}</div>
-                      <div style="font-size:22px;font-weight:800;margin-top:10px;">{int(round(pct*100,0))}%</div>
+                      <div style="font-size:22px;font-weight:800;margin-top:10px;">{pct_txt}</div>
                     </div>
                     """,
-                    unsafe_allow_html=True
+                    unsafe_allow_html=True,
                 )
 
 
 def page_checklist(tables, user: str, dia_str: str):
     st.subheader("Checklist")
 
+    areas_df = tables["areas_df"]
     itens_df = tables["itens_df"]
     logs_df = tables["logs_df"]
+
     _validate_itens_columns(itens_df)
 
-    areas = _available_areas(tables["areas_df"], itens_df)
+    areas = _available_areas(areas_df, itens_df)
     turnos = _available_turnos(itens_df)
 
-    st.write("Selecione Área e Turno e toque em OK para abrir os itens.")
     c1, c2 = st.columns([1, 1])
     with c1:
         area = st.selectbox("Área", areas, key="sel_area")
     with c2:
         turno = st.selectbox("Turno", turnos, key="sel_turno")
 
-    if st.button("OK", type="primary"):
-        st.session_state["ctx_area"] = area
-        st.session_state["ctx_turno"] = turno
-        st.session_state["open_items"] = True
-        st.rerun()
-
-    if not st.session_state.get("open_items", False):
-        st.info("Escolha Área e Turno e aperte OK.")
-        return
-
-    area = st.session_state.get("ctx_area", area)
-    turno = st.session_state.get("ctx_turno", turno)
-
     items = _filter_items_for(itens_df, area, turno, dia_str)
     if items.empty:
-        st.warning("Sem itens para esta combinação.")
+        st.warning("Sem itens para esta combinação de Área, Turno e dia.")
         return
 
     now = _now_ts()
@@ -369,19 +364,21 @@ def page_checklist(tables, user: str, dia_str: str):
 
         dl_raw = str(it.get(COL_DEADLINE, "") or "").strip()
         tol = int(it.get(COL_TOL_MIN, 0) or 0)
-        dl_dt = _parse_deadline_today(dl_raw)
 
-        current = status_map.get((today, area, turno, item_id), "").upper().strip()
+        dl_dt = _parse_deadline_today(dl_raw)
+        current = status_map.get((today, area, turno, item_id), "")
+        current_up = current.upper().strip()
+
         overdue = False
-        if dl_dt is not None and current != "OK":
+        if dl_dt is not None and current_up != "OK":
             overdue = now > (dl_dt + pd.Timedelta(minutes=tol))
 
         box_color = "#f3f4f6"
         label = "Pendente"
-        if current == "OK":
+        if current_up == "OK":
             box_color = "#d1fae5"
             label = "Concluído"
-        elif current in ["NÃO OK", "NAO OK"]:
+        elif current_up in ["NÃO OK", "NAO OK"]:
             box_color = "#fee2e2"
             label = "Não OK"
         if overdue:
@@ -406,7 +403,7 @@ def page_checklist(tables, user: str, dia_str: str):
             unsafe_allow_html=True,
         )
 
-        b1, b2 = st.columns([1, 1])
+        b1, b2, b3 = st.columns([1, 1, 1])
         with b1:
             if st.button("OK", key=f"ok_{area}_{turno}_{item_id}", type="primary"):
                 _write_log(area, turno, item_id, texto, "OK", user, dl_raw, tol, tables)
@@ -414,6 +411,10 @@ def page_checklist(tables, user: str, dia_str: str):
         with b2:
             if st.button("NÃO OK", key=f"nok_{area}_{turno}_{item_id}"):
                 _write_log(area, turno, item_id, texto, "NÃO OK", user, dl_raw, tol, tables)
+                st.rerun()
+        with b3:
+            if st.button("Atualizar", key=f"rf_{area}_{turno}_{item_id}"):
+                _invalidate_cache()
                 st.rerun()
 
 
@@ -441,7 +442,7 @@ def main():
 
         if st.button("Logout"):
             for k in list(st.session_state.keys()):
-                if k != "cache_buster":
+                if k not in ["cache_buster"]:
                     st.session_state.pop(k, None)
             st.rerun()
 
@@ -458,15 +459,24 @@ def main():
 
     st.session_state.setdefault("cache_buster", "v1")
 
-    user = authenticate_user(
-        rules_sheet_id=RULES_SHEET_ID,
-        users_tab_candidates=WS_USERS_CANDIDATES,
-        service_client=service_client,
-    )
+    # Diagnóstico objetivo no login: se RULES_SHEET_ID estiver errado ou sem permissão,
+    # o erro vai aparecer na tela com status 403/404/400 e details.
+    try:
+        user = authenticate_user(
+            rules_sheet_id=RULES_SHEET_ID,
+            users_tab_candidates=WS_USERS_CANDIDATES,
+            service_client=service_client,
+        )
+    except Exception as e:
+        st.error("Falha ao validar login lendo a planilha RULES_SHEET_ID.")
+        st.code(str(e))
+        st.stop()
+
     if not user:
         return
 
-    dia_str = _weekday_pt(_now_ts().date())
+    today = _now_ts().date()
+    dia_str = _weekday_pt(today)
 
     try:
         tables = load_tables(
