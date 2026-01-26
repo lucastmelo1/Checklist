@@ -1,10 +1,16 @@
-from __future__ import annotations
-
 import streamlit as st
+
 from sheets_client import pick_existing_tab, read_df
 
 
 def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], service_client):
+    """
+    Espera uma aba com colunas:
+    - user ou usuario ou login
+    - password ou senha
+
+    Login simples em texto puro.
+    """
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("user_name", "")
 
@@ -19,6 +25,9 @@ def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], serv
 
     if st.button("Entrar", type="primary"):
         svc = service_client()
+
+        # Aqui é onde estava quebrando: se RULES_SHEET_ID estiver errado ou sem permissão,
+        # pick_existing_tab vai levantar RuntimeError com status 403/404 na mensagem.
         users_tab = pick_existing_tab(svc, rules_sheet_id, users_tab_candidates)
 
         users_df = read_df(svc, rules_sheet_id, users_tab)
@@ -28,11 +37,20 @@ def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], serv
 
         users_df.columns = [str(c).strip().lower() for c in users_df.columns]
 
-        col_user = "user" if "user" in users_df.columns else ("usuario" if "usuario" in users_df.columns else None)
-        col_pass = "password" if "password" in users_df.columns else ("senha" if "senha" in users_df.columns else None)
+        col_user = None
+        for c in ["user", "usuario", "login"]:
+            if c in users_df.columns:
+                col_user = c
+                break
+
+        col_pass = None
+        for c in ["password", "senha"]:
+            if c in users_df.columns:
+                col_pass = c
+                break
 
         if not col_user or not col_pass:
-            st.error("A aba de usuários precisa ter colunas user/password (ou usuario/senha).")
+            st.error("A aba de usuários precisa ter colunas user/password (ou usuario/senha, ou login/senha).")
             return None
 
         users_df[col_user] = users_df[col_user].astype(str).str.strip()
