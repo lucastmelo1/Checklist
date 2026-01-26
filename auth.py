@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import streamlit as st
 import pandas as pd
 
@@ -17,13 +19,6 @@ def _pick_users_tab(service, spreadsheet_id: str, candidates: list[str]) -> str:
 
 
 def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], service_client):
-    """
-    Espera uma aba de usuários com colunas:
-    - user  (ou usuario)
-    - password (ou senha)
-
-    Login simples (texto puro), conforme você pediu.
-    """
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("user_name", "")
 
@@ -45,7 +40,7 @@ def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], serv
             return None
 
         users_df.columns = [str(c).strip().lower() for c in users_df.columns]
-        # normalizar
+
         col_user = "user" if "user" in users_df.columns else ("usuario" if "usuario" in users_df.columns else None)
         col_pass = "password" if "password" in users_df.columns else ("senha" if "senha" in users_df.columns else None)
 
