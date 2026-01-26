@@ -1,21 +1,7 @@
 from __future__ import annotations
 
 import streamlit as st
-import pandas as pd
-
-from sheets_client import list_sheet_titles, read_df
-
-
-def _pick_users_tab(service, spreadsheet_id: str, candidates: list[str]) -> str:
-    titles = set(list_sheet_titles(service, spreadsheet_id))
-    for c in candidates:
-        if c in titles:
-            return c
-    lower_map = {t.lower(): t for t in titles}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    raise RuntimeError(f"Não encontrei aba de usuários. Candidatas: {candidates}. Existentes: {sorted(titles)}")
+from sheets_client import pick_existing_tab, read_df
 
 
 def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], service_client):
@@ -33,7 +19,8 @@ def authenticate_user(rules_sheet_id: str, users_tab_candidates: list[str], serv
 
     if st.button("Entrar", type="primary"):
         svc = service_client()
-        users_tab = _pick_users_tab(svc, rules_sheet_id, users_tab_candidates)
+        users_tab = pick_existing_tab(svc, rules_sheet_id, users_tab_candidates)
+
         users_df = read_df(svc, rules_sheet_id, users_tab)
         if users_df.empty:
             st.error("A aba de usuários está vazia.")
