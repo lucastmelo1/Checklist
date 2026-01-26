@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import re
-from typing import List, Any, Optional
+import json
+import logging
+from typing import Any, Optional, List
 
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -20,23 +25,33 @@ def normalize_sheet_id(value: str) -> str:
     return v
 
 
+def _http_error_details(e: HttpError) -> dict:
+    status = getattr(e.resp, "status", None)
+    reason = getattr(e.resp, "reason", "")
+    try:
+        content = e.content.decode("utf-8", errors="ignore")
+    except Exception:
+        content = str(e)
+    return {"status": status, "reason": reason, "content": content}
+
+
 def _service_account_info_from_secrets() -> dict:
-    """
-    Espera st.secrets["gcp_service_account"] como um TOML table.
-    Converte para dict "normal" (evita AttrDict não serializável).
-    """
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError(
-            "Secrets não configurado: faltou [gcp_service_account] no Streamlit Secrets."
-        )
+        raise RuntimeError("Faltou [gcp_service_account] nos Secrets do Streamlit Cloud.")
 
-    sa = st.secrets["gcp_service_account"]
-    info = dict(sa)  # <- isso resolve o erro AttrDict não serializable
+    # Converte AttrDict para dict puro
+    info = dict(st.secrets["gcp_service_account"])
 
-    # Em alguns casos a chave vem com "\\n". Garantimos que vira \n real.
+    # Corrige private_key caso venha com \\n
     pk = info.get("private_key", "")
     if isinstance(pk, str) and "\\n" in pk:
         info["private_key"] = pk.replace("\\n", "\n")
+
+    # Validação mínima
+    must = ["type", "project_id", "private_key_id", "private_key", "client_email"]
+    missing = [k for k in must if not str(info.get(k, "")).strip()]
+    if missing:
+        raise RuntimeError(f"Secrets incompleto em [gcp_service_account]. Faltando: {missing}")
 
     return info
 
@@ -48,42 +63,56 @@ def get_service_cached():
     return build("sheets", "v4", credentials=creds)
 
 
-def list_sheet_titles(service, spreadsheet_id: str) -> List[str]:
+def try_read_header(service, spreadsheet_id: str, tab_name: str, max_cols: int = 26) -> Optional[List[str]]:
+    """
+    Retorna:
+      - None se a aba não existe
+      - [] se existe mas está vazia
+      - [headers...] se existe e tem header
+    """
     spreadsheet_id = normalize_sheet_id(spreadsheet_id)
-    try:
-        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    except HttpError as e:
-        status = getattr(e.resp, "status", None)
-        reason = getattr(e.resp, "reason", "")
-        try:
-            content = e.content.decode("utf-8", errors="ignore")
-        except Exception:
-            content = str(e)
-        raise RuntimeError(
-            f"Sheets API HttpError em list_sheet_titles | status={status} reason={reason} content={content}"
-        ) from e
+    tab_name = (tab_name or "").strip()
+    if not tab_name:
+        return None
 
-    sheets = meta.get("sheets", [])
-    return [s.get("properties", {}).get("title", "") for s in sheets if s.get("properties")]
+    end_col = chr(ord("A") + min(max_cols, 26) - 1)
+    rng = f"{tab_name}!A1:{end_col}1"
 
-
-def _get_values(service, spreadsheet_id: str, range_a1: str) -> list:
-    spreadsheet_id = normalize_sheet_id(spreadsheet_id)
     try:
         resp = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=range_a1
+            spreadsheetId=spreadsheet_id,
+            range=rng
         ).execute()
-        return resp.get("values", [])
+        values = resp.get("values", [])
+        if not values:
+            return []
+        return [str(x).strip() for x in values[0]]
+
     except HttpError as e:
-        status = getattr(e.resp, "status", None)
-        reason = getattr(e.resp, "reason", "")
+        det = _http_error_details(e)
+        # Aba inexistente costuma virar 400 "Unable to parse range"
+        txt = (det.get("content") or "") + " " + str(e)
+        if "Unable to parse range" in txt:
+            return None
+
+        logger.error("Sheets HttpError try_read_header %s", json.dumps(det, ensure_ascii=False))
+        raise RuntimeError(f"Sheets API falhou ao ler header. tab={tab_name} details={det}") from e
+
+
+def pick_existing_tab(service, spreadsheet_id: str, candidates: list[str]) -> str:
+    last_err = None
+    for c in candidates:
         try:
-            content = e.content.decode("utf-8", errors="ignore")
-        except Exception:
-            content = str(e)
-        raise RuntimeError(
-            f"Sheets API HttpError em GET values | range={range_a1} | status={status} reason={reason} content={content}"
-        ) from e
+            hdr = try_read_header(service, spreadsheet_id, c)
+            if hdr is None:
+                continue
+            return c
+        except Exception as e:
+            last_err = e
+
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"Nenhuma aba encontrada nas candidatas: {candidates}")
 
 
 def read_df(service, spreadsheet_id: str, tab_name: str, a1_range: str = "A:Z") -> pd.DataFrame:
@@ -92,23 +121,35 @@ def read_df(service, spreadsheet_id: str, tab_name: str, a1_range: str = "A:Z") 
     if not tab_name:
         return pd.DataFrame()
 
-    values = _get_values(service, spreadsheet_id, f"{tab_name}!{a1_range}")
+    rng = f"{tab_name}!{a1_range}"
+
+    try:
+        resp = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=rng
+        ).execute()
+        values = resp.get("values", [])
+    except HttpError as e:
+        det = _http_error_details(e)
+        logger.error("Sheets HttpError read_df %s", json.dumps(det, ensure_ascii=False))
+        raise RuntimeError(f"Sheets API falhou em read_df. range={rng} details={det}") from e
+
     if not values:
         return pd.DataFrame()
 
     headers = [str(h).strip() for h in values[0]]
     rows = values[1:]
-    df = pd.DataFrame(rows, columns=headers)
-    return df
+    return pd.DataFrame(rows, columns=headers)
 
 
-def ensure_header(service, spreadsheet_id: str, tab_name: str, header: List[str]):
-    """
-    Se a aba estiver vazia, escreve o cabeçalho na linha 1.
-    """
+def ensure_header(service, spreadsheet_id: str, tab_name: str, header: list[str]):
     spreadsheet_id = normalize_sheet_id(spreadsheet_id)
-    existing = _get_values(service, spreadsheet_id, f"{tab_name}!1:1")
-    if existing and len(existing) > 0 and any(str(x).strip() for x in existing[0]):
+
+    hdr = try_read_header(service, spreadsheet_id, tab_name)
+    if hdr is None:
+        raise RuntimeError(f"Aba '{tab_name}' não existe na planilha {spreadsheet_id}.")
+
+    if hdr and any(str(x).strip() for x in hdr):
         return
 
     try:
@@ -119,23 +160,17 @@ def ensure_header(service, spreadsheet_id: str, tab_name: str, header: List[str]
             body={"values": [header]},
         ).execute()
     except HttpError as e:
-        status = getattr(e.resp, "status", None)
-        reason = getattr(e.resp, "reason", "")
-        try:
-            content = e.content.decode("utf-8", errors="ignore")
-        except Exception:
-            content = str(e)
-        raise RuntimeError(
-            f"Sheets API HttpError em ensure_header | status={status} reason={reason} content={content}"
-        ) from e
+        det = _http_error_details(e)
+        logger.error("Sheets HttpError ensure_header %s", json.dumps(det, ensure_ascii=False))
+        raise RuntimeError(f"Sheets API falhou em ensure_header. details={det}") from e
 
 
 def append_row(
     service,
     spreadsheet_id: str,
     tab_name: str,
-    row: List[Any],
-    header_if_empty: Optional[List[str]] = None,
+    row: list[Any],
+    header_if_empty: Optional[list[str]] = None,
 ):
     spreadsheet_id = normalize_sheet_id(spreadsheet_id)
 
@@ -151,12 +186,6 @@ def append_row(
             body={"values": [row]},
         ).execute()
     except HttpError as e:
-        status = getattr(e.resp, "status", None)
-        reason = getattr(e.resp, "reason", "")
-        try:
-            content = e.content.decode("utf-8", errors="ignore")
-        except Exception:
-            content = str(e)
-        raise RuntimeError(
-            f"Sheets API HttpError em append_row | status={status} reason={reason} content={content}"
-        ) from e
+        det = _http_error_details(e)
+        logger.error("Sheets HttpError append_row %s", json.dumps(det, ensure_ascii=False))
+        raise RuntimeError(f"Sheets API falhou em append_row. details={det}") from e
