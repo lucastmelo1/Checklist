@@ -225,7 +225,6 @@ def _clean_hhmm(x: str) -> str:
     s = str(x or "").strip()
     if not s:
         return ""
-    # aceita HH:MM, H:MM, HHMM
     m = re.match(r"^(\d{1,2})[:h]?(\d{2})$", s.lower())
     if not m:
         return ""
@@ -245,7 +244,6 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     c_item = pick_col(df, ["item_id", "id_item", "id", "codigo"])
     c_text = pick_col(df, ["texto", "item", "descricao", "atividade", "tarefa", "nome"])
 
-    # deadline candidates
     c_dead = pick_col(df, ["deadline_hhmm", "deadline", "horario", "hora", "prazo", "horario_hhmm"])
 
     if c_area and c_area != "area_id":
@@ -367,7 +365,7 @@ def latest_status_map_for_day(events_df: pd.DataFrame, day_iso: str) -> Dict[Tup
     return mp
 
 
-def parse_today_deadline(hhmm: str) -> Optional[datetime]:
+def parse_deadline_for_day(day_iso: str, hhmm: str) -> Optional[datetime]:
     s = str(hhmm or "").strip()
     if not s:
         return None
@@ -376,19 +374,34 @@ def parse_today_deadline(hhmm: str) -> Optional[datetime]:
         return None
     hh = int(m.group(1))
     mm = int(m.group(2))
-    now = datetime.now(TZ)
-    return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    d = datetime.fromisoformat(day_iso).date()
+    return datetime(d.year, d.month, d.day, hh, mm, 0, tzinfo=TZ)
 
 
-def compute_item_effective_status(status: str, deadline_hhmm: str) -> str:
-    s = (status or "").strip().upper()
+def compute_item_effective_status_for_day(day_iso: str, raw_status: str, deadline_hhmm: str) -> str:
+    s = (raw_status or "").strip().upper()
     if s in ["OK", "NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
         return "NAO_OK" if "NAO" in s or "NÃO" in s else "OK"
-    # pendente
-    dl = parse_today_deadline(deadline_hhmm)
+
+    dl = parse_deadline_for_day(day_iso, deadline_hhmm)
+
+    # se nao tem deadline, fica pendente
     if dl is None:
         return "PENDENTE"
+
+    # regra: atraso so faz sentido em "hoje" (ou dias passados), nunca em dias futuros
     now = datetime.now(TZ)
+    day_d = datetime.fromisoformat(day_iso).date()
+    today_d = now.date()
+
+    if day_d > today_d:
+        return "PENDENTE"
+
+    # se o dia é passado, qualquer pendente com deadline vira atrasado
+    if day_d < today_d:
+        return "ATRASADO"
+
+    # dia é hoje
     if now > dl:
         return "ATRASADO"
     return "PENDENTE"
@@ -465,12 +478,27 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
     areas = cfg["areas"]
     itens = cfg["itens"]
 
-    today = datetime.now(TZ).date().isoformat()
-    mp = latest_status_map_for_day(events_df, today)
+    # ---- NOVO: filtro de data, default = hoje ----
+    today_d = datetime.now(TZ).date()
+    st.session_state.setdefault("dash_date", today_d)
 
-    if st.button("Atualizar agora"):
-        st.session_state["cache_buster"] += 1
-        st.rerun()
+    colA, colB, colC = st.columns([1.2, 1, 1])
+    with colA:
+        dash_date = st.date_input("Data do dashboard", value=st.session_state["dash_date"])
+        st.session_state["dash_date"] = dash_date
+    with colB:
+        if st.button("Hoje"):
+            st.session_state["dash_date"] = today_d
+            st.session_state["cache_buster"] += 1
+            st.rerun()
+    with colC:
+        if st.button("Atualizar agora"):
+            st.session_state["cache_buster"] += 1
+            st.rerun()
+
+    day_iso = st.session_state["dash_date"].isoformat()
+    mp = latest_status_map_for_day(events_df, day_iso)
+    # ---------------------------------------------
 
     turnos = sorted(itens["turno"].dropna().astype(str).str.strip().unique().tolist())
 
@@ -493,7 +521,7 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
                 key = (area_id, turno, item_id)
                 raw_status = mp.get(key, "PENDENTE")
                 deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
-                eff = compute_item_effective_status(raw_status, deadline)
+                eff = compute_item_effective_status_for_day(day_iso, raw_status, deadline)
                 if eff == "OK":
                     ok += 1
                 elif eff == "NAO_OK":
@@ -503,10 +531,9 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
 
             pct = int(round((ok / total) * 100, 0)) if total else 0
 
-            # cor do card do dashboard por prioridade
             bg = "#0b6a5a" if (total > 0 and ok == total) else "#1f2937"
             if atraso > 0:
-                bg = "#b45309"  # ambar
+                bg = "#b45309"
             elif nok > 0:
                 bg = "#7a1f2b"
             elif ok > 0 and ok < total:
@@ -533,8 +560,8 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
     areas = cfg["areas"]
     itens = cfg["itens"]
 
-    today = datetime.now(TZ).date().isoformat()
-    mp = latest_status_map_for_day(events_df, today)
+    today_iso = datetime.now(TZ).date().isoformat()
+    mp = latest_status_map_for_day(events_df, today_iso)
 
     areas_labels = [f"{r['area_nome']} ({r['area_id']})" for _, r in areas.iterrows()]
     area_sel = st.selectbox("Area", areas_labels, index=0)
@@ -565,7 +592,7 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
         raw_status = mp.get(key, "PENDENTE").upper()
 
         deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
-        eff = compute_item_effective_status(raw_status, deadline)
+        eff = compute_item_effective_status_for_day(today_iso, raw_status, deadline)
         bg, label = card_palette(eff)
 
         deadline_line = ""
@@ -583,7 +610,6 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
             unsafe_allow_html=True,
         )
 
-        # Botoes: todos neutros (sem vermelho). O "ativo" ganha negrito via label com simbolo.
         ok_label = "OK"
         nok_label = "Nao OK"
         rst_label = "Desmarcar"
@@ -592,9 +618,6 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
             ok_label = "OK ✓"
         elif eff == "NAO_OK":
             nok_label = "Nao OK ✗"
-        elif eff == "ATRASADO":
-            # atrasado continua pendente, mas fica claro pelo card
-            pass
 
         c1, c2, c3 = st.columns([1, 1, 1])
 
@@ -633,7 +656,7 @@ def main():
 
         if st.button("Logout"):
             for k in list(st.session_state.keys()):
-                if k not in ["cache_buster"]:
+                if k not in ["cache_buster", "dash_date"]:
                     st.session_state.pop(k, None)
             st.session_state["cache_buster"] += 1
             st.rerun()
