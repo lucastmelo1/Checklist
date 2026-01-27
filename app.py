@@ -38,7 +38,6 @@ div[data-testid="stSidebar"] { width: 280px; }
 """
 st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
-
 # =========================
 # CONFIG
 # =========================
@@ -64,9 +63,14 @@ COL_ITEM_ID = "item_id"
 COL_TEXTO = "texto"
 COL_ATIVO = "ativo"
 COL_ORDEM = "ordem"
-COL_DEADLINE = "deadline"          # HH:MM
-COL_TOL_MIN = "tolerancia_min"     # minutos
+COL_DEADLINE = "deadline"          # HH:MM (opcional)
+COL_TOL_MIN = "tolerancia_min"     # minutos (opcional)
 COL_DIA_SEMANA = "dia_semana"      # opcional
+
+# Status padronizados
+STATUS_OK = "OK"
+STATUS_NOK = "NÃO OK"
+STATUS_PEND = "PENDENTE"
 
 LOG_COLS = [
     "ts",
@@ -132,8 +136,8 @@ def _normalize_itens_df(itens_df: pd.DataFrame) -> pd.DataFrame:
     itens_df = _rename_cols_with_aliases(
         itens_df,
         {
-            "area": ["area_id", "areaid", "setor", "departamento", "area_nome", "area name"],
-            "texto": ["descricao", "desc", "item", "tarefa", "check", "pergunta", "texto_item"],
+            "area": ["area_id", "areaid", "setor", "departamento"],
+            "texto": ["descricao", "desc", "item", "tarefa", "pergunta", "texto_item"],
             "ativo": ["is_active", "active"],
             "ordem": ["order", "sequencia", "seq", "posicao"],
             "deadline": ["prazo", "hora_limite", "horario", "limite", "cutoff"],
@@ -165,7 +169,6 @@ def _validate_itens_columns(itens_df: pd.DataFrame):
             f"A aba ITENS precisa ter as colunas (ou aliases): {sorted(list(needed))}. "
             f"Faltando: {missing}. Colunas atuais: {list(itens_df.columns)}"
         )
-
     if COL_DEADLINE not in itens_df.columns:
         st.warning("A aba ITENS não tem a coluna 'deadline' (HH:MM). Sem isso, não haverá alerta de atraso.")
     if COL_TOL_MIN not in itens_df.columns:
@@ -189,7 +192,6 @@ def _filter_items_for(itens_df: pd.DataFrame, area: str, turno: str, dia_semana:
     df = itens_df.copy()
     df[COL_AREA] = df[COL_AREA].astype(str).str.strip()
     df[COL_TURNO] = df[COL_TURNO].astype(str).str.strip()
-
     df = df[(df[COL_AREA] == area) & (df[COL_TURNO] == turno)]
 
     if COL_ATIVO in df.columns:
@@ -224,54 +226,6 @@ def _parse_deadline_today(deadline_str: str) -> datetime | None:
     mm = int(m.group(2))
     now = _now_ts()
     return datetime(now.year, now.month, now.day, hh, mm, tzinfo=TZ)
-
-
-def _latest_status_map(logs_df: pd.DataFrame):
-    if logs_df.empty:
-        return {}
-    needed = ["data", "area", "turno", "item_id", "status", "ts"]
-    for c in needed:
-        if c not in logs_df.columns:
-            return {}
-
-    df = logs_df.copy()
-    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-    df = df.dropna(subset=["ts"])
-    df["data"] = df["data"].astype(str).str.strip()
-    df["area"] = df["area"].astype(str).str.strip()
-    df["turno"] = df["turno"].astype(str).str.strip()
-    df["item_id"] = df["item_id"].astype(str).str.strip()
-
-    df = df.sort_values("ts")
-    latest = df.groupby(["data", "area", "turno", "item_id"], as_index=False).tail(1)
-
-    mp = {}
-    for _, r in latest.iterrows():
-        mp[(r["data"], r["area"], r["turno"], r["item_id"])] = str(r["status"]).strip()
-    return mp
-
-
-def _card_color(done_pct: float, has_overdue: bool) -> str:
-    if has_overdue:
-        return "#7a1f2b"
-    if done_pct >= 0.999:
-        return "#0b6a5a"
-    if done_pct > 0:
-        return "#8b6b12"
-    return "#2b2b2b"
-
-
-def _render_kpi_card(title: str, subtitle: str, pct: float, has_overdue: bool):
-    color = _card_color(pct, has_overdue)
-    pct_txt = f"{int(round(pct * 100, 0))}%"
-    html = f"""
-    <div style="border-radius:16px;padding:14px 14px 12px 14px;margin:8px 0;background:{color};color:white;">
-      <div style="font-size:16px;font-weight:700;line-height:1.1;">{title}</div>
-      <div style="font-size:13px;opacity:0.9;margin-top:4px;">{subtitle}</div>
-      <div style="font-size:22px;font-weight:800;margin-top:10px;">{pct_txt}</div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
 
 
 def _invalidate_cache():
@@ -315,6 +269,48 @@ def load_tables(cache_buster: str, config_sheet_id: str, rules_sheet_id: str, lo
     }
 
 
+def _latest_status_map(logs_df: pd.DataFrame):
+    """
+    Retorna o último status por (data, area, turno, item_id).
+    Regras:
+      - Se não existe log, status é PENDENTE (implícito).
+      - Se último log for PENDENTE, volta ao estado desmarcado.
+    """
+    if logs_df.empty:
+        return {}
+
+    needed = ["data", "area", "turno", "item_id", "status", "ts"]
+    for c in needed:
+        if c not in logs_df.columns:
+            return {}
+
+    df = logs_df.copy()
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts"])
+
+    df["data"] = df["data"].astype(str).str.strip()
+    df["area"] = df["area"].astype(str).str.strip()
+    df["turno"] = df["turno"].astype(str).str.strip()
+    df["item_id"] = df["item_id"].astype(str).str.strip()
+    df["status"] = df["status"].astype(str).str.strip()
+
+    df = df.sort_values("ts")
+    latest = df.groupby(["data", "area", "turno", "item_id"], as_index=False).tail(1)
+
+    mp = {}
+    for _, r in latest.iterrows():
+        stt = str(r["status"]).strip().upper()
+        if stt in ["", "NAN", "NONE"]:
+            stt = STATUS_PEND
+        # normaliza NAO OK sem acento
+        if stt == "NAO OK":
+            stt = STATUS_NOK
+        if stt not in [STATUS_OK, STATUS_NOK, STATUS_PEND]:
+            stt = STATUS_PEND
+        mp[(r["data"], r["area"], r["turno"], r["item_id"])] = stt
+    return mp
+
+
 def _write_log(area: str, turno: str, item_id: str, texto: str, status: str, user: str, deadline: str, tol: int, tables):
     svc = service_client()
     ws_logs = tables["ws_logs"]
@@ -337,14 +333,55 @@ def _write_log(area: str, turno: str, item_id: str, texto: str, status: str, use
     _invalidate_cache()
 
 
+def _status_style(status: str, overdue: bool) -> tuple[str, str]:
+    """
+    Retorna (cor do card, label do status).
+    """
+    status = (status or STATUS_PEND).strip().upper()
+    if status == "NAO OK":
+        status = STATUS_NOK
+
+    if status == STATUS_OK:
+        return ("#d1fae5", "Concluído (OK)")
+    if status == STATUS_NOK:
+        return ("#fee2e2", "Marcado como NÃO OK")
+
+    # pendente
+    if overdue:
+        return ("#ffe4e6", "Pendente (Atrasado)")
+    return ("#f3f4f6", "Pendente")
+
+
+def _card_color_kpi(done_pct: float, has_overdue: bool) -> str:
+    if has_overdue:
+        return "#7a1f2b"
+    if done_pct >= 0.999:
+        return "#0b6a5a"
+    if done_pct > 0:
+        return "#8b6b12"
+    return "#2b2b2b"
+
+
+def _render_kpi_card(title: str, subtitle: str, pct: float, has_overdue: bool):
+    color = _card_color_kpi(pct, has_overdue)
+    pct_txt = f"{int(round(pct * 100, 0))}%"
+    html = f"""
+    <div style="border-radius:16px;padding:14px 14px 12px 14px;margin:8px 0;background:{color};color:white;">
+      <div style="font-size:16px;font-weight:700;line-height:1.1;">{title}</div>
+      <div style="font-size:13px;opacity:0.9;margin-top:4px;">{subtitle}</div>
+      <div style="font-size:22px;font-weight:800;margin-top:10px;">{pct_txt}</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
 # =========================
 # PAGES
 # =========================
 
 def page_dashboard(tables, dia_str: str):
     st.subheader("Dashboard operacional")
-
-    st.caption("Atualização automática a cada 6 segundos. Se estiver lento, use Atualizar agora.")
+    st.caption("Atualização automática. Se estiver lento, use Atualizar agora.")
     st.session_state.setdefault("auto_refresh_sec", 6)
 
     colA, colB = st.columns([1, 1])
@@ -400,18 +437,19 @@ def page_dashboard(tables, dia_str: str):
             for _, it in items.iterrows():
                 item_id = str(it[COL_ITEM_ID]).strip()
                 key = (today, area, turno, item_id)
-                stt = status_map.get(key, "")
-                if stt.upper() == "OK":
+                stt = status_map.get(key, STATUS_PEND)
+
+                if stt == STATUS_OK:
                     done += 1
 
                 dl = _parse_deadline_today(str(it.get(COL_DEADLINE, "") or "").strip())
                 tol = int(it.get(COL_TOL_MIN, 0) or 0)
-                if dl is not None and stt.upper() != "OK":
+                if dl is not None and stt != STATUS_OK:
                     if now > (dl + pd.Timedelta(minutes=tol)):
                         has_overdue = True
 
             pct = done / total if total else 0.0
-            subtitle = f"{done}/{total} concluídos"
+            subtitle = f"{done}/{total} OK"
 
             with cols[idx % len(cols)]:
                 _render_kpi_card(turno, subtitle, pct, has_overdue)
@@ -459,8 +497,20 @@ def page_checklist(tables, user: str, dia_str: str):
     status_map = _latest_status_map(logs_df)
 
     st.markdown(f"### {area} | {turno}")
-    st.caption("Use OK ou NÃO OK por item. Isso registra no LOGS e atualiza o dashboard.")
+    st.caption("Tudo começa como Pendente. Clique em OK, NÃO OK ou DESMARCAR. O card muda de cor conforme o último clique.")
 
+    # progresso
+    total = len(items)
+    ok_count = 0
+    for _, it in items.iterrows():
+        item_id = str(it[COL_ITEM_ID]).strip()
+        stt = status_map.get((today, area, turno, item_id), STATUS_PEND)
+        if stt == STATUS_OK:
+            ok_count += 1
+    st.progress(ok_count / total if total else 0.0)
+    st.caption(f"{ok_count}/{total} concluídos (OK)")
+
+    # render itens
     for _, it in items.iterrows():
         item_id = str(it[COL_ITEM_ID]).strip()
         texto = str(it[COL_TEXTO]).strip()
@@ -469,34 +519,19 @@ def page_checklist(tables, user: str, dia_str: str):
         tol = int(it.get(COL_TOL_MIN, 0) or 0)
         dl_dt = _parse_deadline_today(dl_raw)
 
-        current = status_map.get((today, area, turno, item_id), "")
-        current_up = current.upper().strip()
-
+        current = status_map.get((today, area, turno, item_id), STATUS_PEND)
         overdue = False
-        if dl_dt is not None:
-            overdue = (current_up != "OK") and (now > (dl_dt + pd.Timedelta(minutes=tol)))
+        if dl_dt is not None and current != STATUS_OK:
+            overdue = now > (dl_dt + pd.Timedelta(minutes=tol))
 
-        box_color = "#f3f4f6"
-        label = "Pendente"
-        if current_up == "OK":
-            box_color = "#d1fae5"
-            label = "Concluído"
-        elif current_up in ["NÃO OK", "NAO OK"]:
-            box_color = "#fee2e2"
-            label = "Não OK"
-        elif current_up:
-            box_color = "#e5e7eb"
-            label = current_up
-
-        if overdue:
-            box_color = "#ffe4e6"
+        box_color, label = _status_style(current, overdue)
 
         deadline_txt = ""
         if dl_dt is not None:
             deadline_txt = f"Deadline {dl_raw}"
             if tol > 0:
                 deadline_txt += f" (+{tol} min)"
-            if overdue:
+            if overdue and current != STATUS_OK:
                 deadline_txt += " | ATRASADO"
 
         st.markdown(
@@ -510,16 +545,21 @@ def page_checklist(tables, user: str, dia_str: str):
             unsafe_allow_html=True,
         )
 
-        b1, b2, b3 = st.columns([1, 1, 1])
+        b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
         with b1:
             if st.button("OK", key=f"ok_{area}_{turno}_{item_id}", type="primary"):
-                _write_log(area, turno, item_id, texto, "OK", user, dl_raw, tol, tables)
+                _write_log(area, turno, item_id, texto, STATUS_OK, user, dl_raw, tol, tables)
                 st.rerun()
         with b2:
             if st.button("NÃO OK", key=f"nok_{area}_{turno}_{item_id}"):
-                _write_log(area, turno, item_id, texto, "NÃO OK", user, dl_raw, tol, tables)
+                _write_log(area, turno, item_id, texto, STATUS_NOK, user, dl_raw, tol, tables)
                 st.rerun()
         with b3:
+            # desmarcar volta ao estado original
+            if st.button("DESMARCAR", key=f"undo_{area}_{turno}_{item_id}"):
+                _write_log(area, turno, item_id, texto, STATUS_PEND, user, dl_raw, tol, tables)
+                st.rerun()
+        with b4:
             if st.button("Atualizar", key=f"rf_{area}_{turno}_{item_id}"):
                 _invalidate_cache()
                 st.rerun()
@@ -527,6 +567,7 @@ def page_checklist(tables, user: str, dia_str: str):
 
 def page_logs(tables):
     st.subheader("LOGS")
+    st.caption("Últimos registros. Atualize para ver alterações recentes.")
     if st.button("Atualizar LOGS"):
         _invalidate_cache()
         st.rerun()
@@ -566,7 +607,7 @@ def main():
             st.caption(str(e))
 
         st.markdown("### Navegação")
-        st.session_state.setdefault("nav", "Dashboard")
+        st.session_state.setdefault("nav", "Checklist")
         st.radio(
             "Ir para",
             ["Dashboard", "Checklist", "LOGS"],
@@ -595,12 +636,12 @@ def main():
     )
 
     nav = st.session_state.get("nav")
-    if nav == "Checklist":
-        page_checklist(tables, user, dia_str)
+    if nav == "Dashboard":
+        page_dashboard(tables, dia_str)
     elif nav == "LOGS":
         page_logs(tables)
     else:
-        page_dashboard(tables, dia_str)
+        page_checklist(tables, user, dia_str)
 
 
 if __name__ == "__main__":
