@@ -1,42 +1,18 @@
 import os
-import time
 import re
+import time
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
-from sheets_client import (
-    get_service_cached,
-    read_df,
-    append_row,
-    pick_existing_tab,
-)
+from sheets_client import get_service_cached, read_df, append_row, pick_existing_tab
 from auth import authenticate_user
+
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
-st.set_page_config(page_title="Checklist Operacional", layout="wide", initial_sidebar_state="expanded")
-
-MOBILE_CSS = """
-<style>
-.block-container { padding-top: 1.2rem; padding-left: 0.9rem; padding-right: 0.9rem; }
-header[data-testid="stHeader"] { height: 0px !important; }
-div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
-footer { visibility: hidden; height: 0px; }
-h1,h2,h3 { margin-top: 0.6rem; }
-div[data-testid="stSidebar"] { width: 280px; }
-@media (max-width: 700px){
-  .block-container { padding-top: 1.6rem; }
-  h1 { font-size: 1.35rem !important; }
-  h2 { font-size: 1.10rem !important; }
-  h3 { font-size: 1.00rem !important; }
-  .stButton button { width: 100%; }
-}
-</style>
-"""
-st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
 def _get_cfg(name: str, default: str = "") -> str:
     if hasattr(st, "secrets") and "app" in st.secrets and name in st.secrets["app"]:
@@ -85,6 +61,28 @@ LOG_COLS = [
 ]
 
 TURNOS_DEFAULT = ["Almoço", "Jantar"]
+
+
+st.set_page_config(page_title="Checklist Operacional", layout="wide", initial_sidebar_state="expanded")
+
+MOBILE_CSS = """
+<style>
+.block-container { padding-top: 1.2rem; padding-left: 0.9rem; padding-right: 0.9rem; }
+header[data-testid="stHeader"] { height: 0px !important; }
+div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
+footer { visibility: hidden; height: 0px; }
+h1,h2,h3 { margin-top: 0.6rem; }
+div[data-testid="stSidebar"] { width: 280px; }
+@media (max-width: 700px){
+  .block-container { padding-top: 1.6rem; }
+  h1 { font-size: 1.35rem !important; }
+  h2 { font-size: 1.10rem !important; }
+  h3 { font-size: 1.00rem !important; }
+  .stButton button { width: 100%; }
+}
+</style>
+"""
+st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
 
 def _now_ts() -> datetime:
@@ -220,6 +218,7 @@ def _parse_deadline_today(deadline_str: str) -> datetime | None:
 
 def _invalidate_cache():
     st.cache_data.clear()
+    st.session_state["cache_buster"] = str(time.time())
 
 
 @st.cache_resource
@@ -227,7 +226,7 @@ def service_client():
     return get_service_cached()
 
 
-@st.cache_data(ttl=1)
+@st.cache_data(ttl=2)
 def load_tables(cache_buster: str, config_sheet_id: str, rules_sheet_id: str, logs_sheet_id: str):
     svc = service_client()
 
@@ -259,10 +258,6 @@ def load_tables(cache_buster: str, config_sheet_id: str, rules_sheet_id: str, lo
 
 
 def _session_start_map(logs_df: pd.DataFrame) -> dict[tuple[str, str, str], pd.Timestamp]:
-    """
-    Retorna o último ts de START por (data, area, turno).
-    Se não existir, considera None e o app começa no primeiro log do dia (comportamento antigo).
-    """
     if logs_df.empty:
         return {}
 
@@ -294,11 +289,7 @@ def _session_start_map(logs_df: pd.DataFrame) -> dict[tuple[str, str, str], pd.T
     return mp
 
 
-def _latest_status_map(logs_df: pd.DataFrame):
-    """
-    Status por (data, area, turno, item_id) considerando somente logs após o último START do turno.
-    Se não há START, mantém comportamento antigo.
-    """
+def _latest_status_map(logs_df: pd.DataFrame) -> dict:
     if logs_df.empty:
         return {}
 
@@ -319,21 +310,27 @@ def _latest_status_map(logs_df: pd.DataFrame):
 
     start_map = _session_start_map(df)
 
-    # remove linhas START do cálculo de status normal
     df_normal = df[df["item_id"] != SESSION_ITEM_ID].copy()
 
-    # filtra por start ts quando existir
     if start_map:
-        keep_rows = []
-        for (data_s, area_s, turno_s), start_ts in start_map.items():
-            part = df_normal[(df_normal["data"] == data_s) & (df_normal["area"] == area_s) & (df_normal["turno"] == turno_s)]
-            part = part[part["ts"] >= start_ts]
-            keep_rows.append(part)
-        # inclui também combinações sem START
+        parts = []
         combos_with_start = set(start_map.keys())
-        no_start = df_normal[~df_normal.apply(lambda r: (r["data"], r["area"], r["turno"]) in combos_with_start, axis=1)]
-        keep_rows.append(no_start)
-        df_normal = pd.concat(keep_rows, ignore_index=True) if keep_rows else df_normal
+
+        for (data_s, area_s, turno_s), start_ts in start_map.items():
+            part = df_normal[
+                (df_normal["data"] == data_s)
+                & (df_normal["area"] == area_s)
+                & (df_normal["turno"] == turno_s)
+                & (df_normal["ts"] >= start_ts)
+            ]
+            parts.append(part)
+
+        no_start = df_normal[
+            ~df_normal.apply(lambda r: (r["data"], r["area"], r["turno"]) in combos_with_start, axis=1)
+        ]
+        parts.append(no_start)
+
+        df_normal = pd.concat(parts, ignore_index=True) if parts else df_normal
 
     df_normal = df_normal.sort_values("ts")
     latest = df_normal.groupby(["data", "area", "turno", "item_id"], as_index=False).tail(1)
@@ -354,6 +351,7 @@ def _write_log(area: str, turno: str, item_id: str, texto: str, status: str, use
     svc = service_client()
     ws_logs = tables["ws_logs"]
     now = _now_ts()
+
     row = [
         now.isoformat(),
         now.date().isoformat(),
@@ -372,9 +370,6 @@ def _write_log(area: str, turno: str, item_id: str, texto: str, status: str, use
 
 
 def _start_session(area: str, turno: str, user: str, tables):
-    """
-    Marca oficialmente o início do turno. A partir daqui, tudo começa PENDENTE.
-    """
     _write_log(
         area=area,
         turno=turno,
@@ -394,12 +389,12 @@ def _status_style(status: str, overdue: bool) -> tuple[str, str]:
         status = STATUS_NOK
 
     if status == STATUS_OK:
-        return ("#d1fae5", "Concluído (OK)")
+        return ("#d1fae5", "OK")
     if status == STATUS_NOK:
-        return ("#fee2e2", "Não OK")
+        return ("#fee2e2", "NÃO OK")
     if overdue:
-        return ("#ffe4e6", "Pendente (Atrasado)")
-    return ("#f3f4f6", "Pendente")
+        return ("#ffe4e6", "PENDENTE (ATRASADO)")
+    return ("#f3f4f6", "PENDENTE")
 
 
 def _card_color_kpi(done_pct: float, has_overdue: bool) -> str:
@@ -428,9 +423,13 @@ def _render_kpi_card(title: str, subtitle: str, pct: float, has_overdue: bool):
 def page_dashboard(tables, dia_str: str):
     st.subheader("Dashboard operacional")
 
-    if st.button("Atualizar agora"):
-        _invalidate_cache()
-        st.rerun()
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Atualizar agora"):
+            _invalidate_cache()
+            st.rerun()
+    with c2:
+        st.caption("Dashboard considera somente a sessão do turno (após Início do turno).")
 
     areas_df = tables["areas_df"]
     itens_df = tables["itens_df"]
@@ -499,17 +498,23 @@ def page_checklist(tables, user: str, dia_str: str):
     with c2:
         turno = st.selectbox("Turno", turnos, key="sel_turno")
 
-    # Aqui é o ponto crítico
-    # Ao abrir, marca START, assim tudo começa pendente
-    if st.button("Abrir checklist", type="primary"):
-        st.session_state["ctx_area"] = area
-        st.session_state["ctx_turno"] = turno
-        st.session_state["open_items"] = True
-        _start_session(area, turno, user, tables)
-        st.rerun()
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("Iniciar turno (zerar checklist)", type="primary"):
+            st.session_state["ctx_area"] = area
+            st.session_state["ctx_turno"] = turno
+            st.session_state["open_items"] = True
+            _start_session(area, turno, user, tables)
+            st.rerun()
+    with b2:
+        if st.button("Abrir sem zerar"):
+            st.session_state["ctx_area"] = area
+            st.session_state["ctx_turno"] = turno
+            st.session_state["open_items"] = True
+            st.rerun()
 
     if not st.session_state.get("open_items", False):
-        st.info("Selecione Área e Turno e clique em Abrir checklist.")
+        st.info("Selecione Área e Turno. Use Iniciar turno para começar tudo pendente.")
         return
 
     area = st.session_state.get("ctx_area", area)
@@ -525,7 +530,7 @@ def page_checklist(tables, user: str, dia_str: str):
     status_map = _latest_status_map(logs_df)
 
     st.markdown(f"### {area} | {turno}")
-    st.caption("Tudo começa Pendente após abrir o checklist. Use OK, NÃO OK ou DESMARCAR. As cores mudam na hora.")
+    st.caption("Use OK, NÃO OK ou DESMARCAR. O card muda de cor imediatamente.")
 
     total = len(items)
     ok_count = 0
@@ -572,20 +577,20 @@ def page_checklist(tables, user: str, dia_str: str):
             unsafe_allow_html=True,
         )
 
-        b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
-        with b1:
+        c_ok, c_nok, c_undo, c_rf = st.columns([1, 1, 1, 1])
+        with c_ok:
             if st.button("OK", key=f"ok_{area}_{turno}_{item_id}", type="primary"):
                 _write_log(area, turno, item_id, texto, STATUS_OK, user, dl_raw, tol, tables)
                 st.rerun()
-        with b2:
+        with c_nok:
             if st.button("NÃO OK", key=f"nok_{area}_{turno}_{item_id}"):
                 _write_log(area, turno, item_id, texto, STATUS_NOK, user, dl_raw, tol, tables)
                 st.rerun()
-        with b3:
+        with c_undo:
             if st.button("DESMARCAR", key=f"undo_{area}_{turno}_{item_id}"):
                 _write_log(area, turno, item_id, texto, STATUS_PEND, user, dl_raw, tol, tables)
                 st.rerun()
-        with b4:
+        with c_rf:
             if st.button("Atualizar", key=f"rf_{area}_{turno}_{item_id}"):
                 _invalidate_cache()
                 st.rerun()
@@ -625,13 +630,14 @@ def main():
             st.success("Google Sheets conectado")
         except Exception as e:
             st.error("Falha ao conectar no Google Sheets")
-            st.caption(str(e))
+            st.info(str(e))
+            return
 
         st.markdown("### Navegação")
         st.session_state.setdefault("nav", "Checklist")
         st.radio("Ir para", ["Dashboard", "Checklist", "LOGS"], key="nav", label_visibility="collapsed")
 
-    st.session_state.setdefault("cache_buster", "v1")
+    st.session_state.setdefault("cache_buster", str(time.time()))
 
     user = authenticate_user(
         rules_sheet_id=RULES_SHEET_ID,
