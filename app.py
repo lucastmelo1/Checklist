@@ -59,7 +59,14 @@ LOGS_SHEET_ID = normalize_sheet_id(_get_cfg("LOGS_SHEET_ID", ""))
 
 
 def require_ids():
-    missing = [k for k, v in [("CONFIG_SHEET_ID", CONFIG_SHEET_ID), ("RULES_SHEET_ID", RULES_SHEET_ID), ("LOGS_SHEET_ID", LOGS_SHEET_ID)] if not v]
+    missing = [
+        k for k, v in [
+            ("CONFIG_SHEET_ID", CONFIG_SHEET_ID),
+            ("RULES_SHEET_ID", RULES_SHEET_ID),
+            ("LOGS_SHEET_ID", LOGS_SHEET_ID),
+        ]
+        if not v
+    ]
     if missing:
         raise RuntimeError(f"Secrets faltando: {', '.join(missing)}")
 
@@ -111,7 +118,7 @@ def pick_tab(sheet_id: str, candidates: List[str]) -> str:
     raise RuntimeError(f"Nenhuma aba encontrada em {sheet_id}. Candidatas: {candidates}. Existentes: {titles}")
 
 
-def get_or_create_tab(sheet_id: str, title: str, rows=5000, cols=20):
+def get_or_create_tab(sheet_id: str, title: str, rows=5000, cols=30):
     sh = open_sheet(sheet_id)
 
     def _do():
@@ -148,6 +155,7 @@ def norm_cols(cols: List[str]) -> List[str]:
     for c in cols:
         c2 = str(c).strip().lower()
         c2 = c2.replace(" ", "_")
+        c2 = c2.replace("-", "_")
         out.append(c2)
     return out
 
@@ -189,7 +197,6 @@ def require_cols(df: pd.DataFrame, required: List[str], friendly: str):
 
 def map_areas(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # mapear nomes comuns
     ren = {}
     c_id = pick_col(df, ["area_id", "area", "id_area"])
     c_nm = pick_col(df, ["area_nome", "nome", "area_name"])
@@ -214,6 +221,21 @@ def map_areas(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _clean_hhmm(x: str) -> str:
+    s = str(x or "").strip()
+    if not s:
+        return ""
+    # aceita HH:MM, H:MM, HHMM
+    m = re.match(r"^(\d{1,2})[:h]?(\d{2})$", s.lower())
+    if not m:
+        return ""
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return ""
+    return f"{hh:02d}:{mm:02d}"
+
+
 def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     ren = {}
@@ -223,6 +245,9 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     c_item = pick_col(df, ["item_id", "id_item", "id", "codigo"])
     c_text = pick_col(df, ["texto", "item", "descricao", "atividade", "tarefa", "nome"])
 
+    # deadline candidates
+    c_dead = pick_col(df, ["deadline_hhmm", "deadline", "horario", "hora", "prazo", "horario_hhmm"])
+
     if c_area and c_area != "area_id":
         ren[c_area] = "area_id"
     if c_turno and c_turno != "turno":
@@ -231,6 +256,8 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
         ren[c_item] = "item_id"
     if c_text and c_text != "texto":
         ren[c_text] = "texto"
+    if c_dead and c_dead != "deadline_hhmm":
+        ren[c_dead] = "deadline_hhmm"
 
     if ren:
         df = df.rename(columns=ren)
@@ -241,6 +268,9 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     df["turno"] = df["turno"].astype(str).str.strip()
     df["item_id"] = df["item_id"].astype(str).str.strip()
     df["texto"] = df["texto"].astype(str).str.strip()
+
+    if "deadline_hhmm" in df.columns:
+        df["deadline_hhmm"] = df["deadline_hhmm"].apply(_clean_hhmm)
 
     if "ativo" in df.columns:
         df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
@@ -278,7 +308,6 @@ def map_users(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def load_config_tables(cache_buster: int) -> Dict[str, pd.DataFrame]:
     require_ids()
-
     ws_areas = pick_tab(CONFIG_SHEET_ID, WS_AREAS_CANDIDATES)
     ws_itens = pick_tab(CONFIG_SHEET_ID, WS_ITENS_CANDIDATES)
 
@@ -302,10 +331,9 @@ def load_users_table(cache_buster: int) -> pd.DataFrame:
 @st.cache_data(ttl=30)
 def load_events_last(cache_buster: int, last_rows: int = 2000) -> pd.DataFrame:
     require_ids()
-    ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=10000, cols=20)
+    ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=20000, cols=30)
     write_header_if_empty(ws, EVENTS_HEADER)
 
-    # ler tudo pode estourar quota, então vamos ler "tudo" mas com cache curto e refresh manual
     values = retryable(lambda: ws.get_all_values())
     df = to_df(values)
     if df.empty:
@@ -339,12 +367,41 @@ def latest_status_map_for_day(events_df: pd.DataFrame, day_iso: str) -> Dict[Tup
     return mp
 
 
-def card_style(status: str) -> Tuple[str, str]:
+def parse_today_deadline(hhmm: str) -> Optional[datetime]:
+    s = str(hhmm or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{2}):(\d{2})$", s)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    now = datetime.now(TZ)
+    return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def compute_item_effective_status(status: str, deadline_hhmm: str) -> str:
     s = (status or "").strip().upper()
+    if s in ["OK", "NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
+        return "NAO_OK" if "NAO" in s or "NÃO" in s else "OK"
+    # pendente
+    dl = parse_today_deadline(deadline_hhmm)
+    if dl is None:
+        return "PENDENTE"
+    now = datetime.now(TZ)
+    if now > dl:
+        return "ATRASADO"
+    return "PENDENTE"
+
+
+def card_palette(effective_status: str) -> Tuple[str, str]:
+    s = (effective_status or "").strip().upper()
     if s == "OK":
         return "#d1fae5", "Concluido"
-    if s in ["NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
+    if s == "NAO_OK":
         return "#fee2e2", "Nao OK"
+    if s == "ATRASADO":
+        return "#ffedd5", "Atrasado"
     return "#f3f4f6", "Pendente"
 
 
@@ -420,27 +477,37 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
     for _, a in areas.iterrows():
         area_id = str(a["area_id"]).strip()
         area_nome = str(a["area_nome"]).strip()
-
         st.markdown(f"### {area_nome}")
 
         cols = st.columns(2 if len(turnos) >= 2 else 1)
         for i, turno in enumerate(turnos):
             df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno)].copy()
             total = len(df_items)
+
             ok = 0
             nok = 0
+            atraso = 0
+
             for _, it in df_items.iterrows():
-                key = (area_id, turno, str(it["item_id"]).strip())
-                stt = mp.get(key, "PENDENTE")
-                if stt == "OK":
+                item_id = str(it["item_id"]).strip()
+                key = (area_id, turno, item_id)
+                raw_status = mp.get(key, "PENDENTE")
+                deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
+                eff = compute_item_effective_status(raw_status, deadline)
+                if eff == "OK":
                     ok += 1
-                elif stt in ["NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
+                elif eff == "NAO_OK":
                     nok += 1
+                elif eff == "ATRASADO":
+                    atraso += 1
 
             pct = int(round((ok / total) * 100, 0)) if total else 0
 
+            # cor do card do dashboard por prioridade
             bg = "#0b6a5a" if (total > 0 and ok == total) else "#1f2937"
-            if nok > 0:
+            if atraso > 0:
+                bg = "#b45309"  # ambar
+            elif nok > 0:
                 bg = "#7a1f2b"
             elif ok > 0 and ok < total:
                 bg = "#8b6b12"
@@ -450,7 +517,9 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
                     f"""
                     <div style="border-radius:16px;padding:14px;margin:8px 0;background:{bg};color:white;">
                       <div style="font-size:16px;font-weight:800;">{turno}</div>
-                      <div style="font-size:13px;opacity:0.9;margin-top:4px;">OK {ok}/{total} | Nao OK {nok}</div>
+                      <div style="font-size:13px;opacity:0.95;margin-top:6px;">
+                        OK {ok}/{total} | Nao OK {nok} | Atrasado {atraso}
+                      </div>
                       <div style="font-size:22px;font-weight:900;margin-top:10px;">{pct}%</div>
                     </div>
                     """,
@@ -469,7 +538,6 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
 
     areas_labels = [f"{r['area_nome']} ({r['area_id']})" for _, r in areas.iterrows()]
     area_sel = st.selectbox("Area", areas_labels, index=0)
-
     area_id = area_sel.split("(")[-1].replace(")", "").strip()
 
     turnos = sorted(itens[itens["area_id"] == area_id]["turno"].dropna().astype(str).str.strip().unique().tolist())
@@ -479,6 +547,10 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
 
     turno_sel = st.selectbox("Turno", turnos, index=0)
 
+    if st.button("Atualizar lista"):
+        st.session_state["cache_buster"] += 1
+        st.rerun()
+
     df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno_sel)].copy()
     if df_items.empty:
         st.warning("Sem itens para esta combinacao.")
@@ -486,42 +558,58 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
 
     st.caption("Tudo comeca PENDENTE. Clique OK, Nao OK ou Desmarcar.")
 
-    if st.button("Atualizar lista"):
-        st.session_state["cache_buster"] += 1
-        st.rerun()
-
     for _, it in df_items.iterrows():
         item_id = str(it["item_id"]).strip()
         texto = str(it["texto"]).strip()
         key = (area_id, turno_sel, item_id)
-        status = mp.get(key, "PENDENTE").upper()
+        raw_status = mp.get(key, "PENDENTE").upper()
 
-        bg, label = card_style(status)
+        deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
+        eff = compute_item_effective_status(raw_status, deadline)
+        bg, label = card_palette(eff)
+
+        deadline_line = ""
+        if deadline:
+            deadline_line = f"<div style='font-size:12px;margin-top:4px;opacity:0.85;'><b>Deadline:</b> {deadline}</div>"
 
         st.markdown(
             f"""
             <div style="border-radius:14px;padding:12px;background:{bg};margin:10px 0;">
               <div style="font-size:15px;font-weight:900;">{texto}</div>
               <div style="font-size:12px;margin-top:6px;"><b>Status:</b> {label}</div>
+              {deadline_line}
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+        # Botoes: todos neutros (sem vermelho). O "ativo" ganha negrito via label com simbolo.
+        ok_label = "OK"
+        nok_label = "Nao OK"
+        rst_label = "Desmarcar"
+
+        if eff == "OK":
+            ok_label = "OK ✓"
+        elif eff == "NAO_OK":
+            nok_label = "Nao OK ✗"
+        elif eff == "ATRASADO":
+            # atrasado continua pendente, mas fica claro pelo card
+            pass
+
         c1, c2, c3 = st.columns([1, 1, 1])
 
         with c1:
-            if st.button("OK", key=f"ok_{area_id}_{turno_sel}_{item_id}", type="primary"):
+            if st.button(ok_label, key=f"ok_{area_id}_{turno_sel}_{item_id}"):
                 write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "OK")
                 st.rerun()
 
         with c2:
-            if st.button("Nao OK", key=f"nok_{area_id}_{turno_sel}_{item_id}"):
+            if st.button(nok_label, key=f"nok_{area_id}_{turno_sel}_{item_id}"):
                 write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "NAO_OK")
                 st.rerun()
 
         with c3:
-            if st.button("Desmarcar", key=f"rst_{area_id}_{turno_sel}_{item_id}"):
+            if st.button(rst_label, key=f"rst_{area_id}_{turno_sel}_{item_id}"):
                 write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "PENDENTE")
                 st.rerun()
 
