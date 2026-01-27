@@ -1,9 +1,9 @@
 import os
-import time
 import re
+import time
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +18,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-EVENT_COLS = [
+EVENTS_TAB = "EVENTS"
+EVENTS_HEADER = [
     "ts_iso",
     "data",
     "hora",
@@ -30,54 +31,40 @@ EVENT_COLS = [
     "item_id",
     "texto",
     "status",
+    "obs",
 ]
 
-WS_AREAS_CANDIDATES = ["AREAS", "Areas", "Checklist_Areas", "CHECKLIST_AREAS"]
-WS_ITENS_CANDIDATES = ["ITENS", "Itens", "Checklist_Itens", "CHECKLIST_ITENS"]
-WS_USERS_CANDIDATES = ["USUARIOS", "Usuarios", "Users", "USERS", "Login", "LOGIN", "USUARIOS "]
-WS_EVENTS_CANDIDATES = ["EVENTS", "Checklist_Events", "CHECKLIST_EVENTS"]
-
-COL_AREA_ID = "area_id"
-COL_AREA_NOME = "area_nome"
-COL_ATIVO = "ativo"
-COL_ORDEM = "ordem"
-
-COL_ITEM_ID = "item_id"
-COL_TEXTO = "texto"
-COL_TURNO = "turno"
-COL_AREA_REF = "area_id"
+WS_AREAS_CANDIDATES = ["AREAS", "Areas", "areas"]
+WS_ITENS_CANDIDATES = ["ITENS", "Itens", "itens"]
+WS_USERS_CANDIDATES = ["USUARIOS", "Usuarios", "usuarios", "USERS", "Users", "users"]
 
 
 def _get_cfg(name: str, default: str = "") -> str:
-    if hasattr(st, "secrets") and "app" in st.secrets and name in st.secrets["app"]:
-        return str(st.secrets["app"][name]).strip()
     if hasattr(st, "secrets") and name in st.secrets:
         return str(st.secrets[name]).strip()
+    if hasattr(st, "secrets") and "app" in st.secrets and name in st.secrets["app"]:
+        return str(st.secrets["app"][name]).strip()
     return os.getenv(name, default).strip()
-
-
-CONFIG_SHEET_ID = _get_cfg("CONFIG_SHEET_ID", "")
-RULES_SHEET_ID = _get_cfg("RULES_SHEET_ID", "")
-LOGS_SHEET_ID = _get_cfg("LOGS_SHEET_ID", "")
 
 
 def normalize_sheet_id(value: str) -> str:
     v = (value or "").strip()
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", v)
-    if m:
-        return m.group(1)
-    return v
+    return m.group(1) if m else v
 
 
-def _require_ids():
-    if not CONFIG_SHEET_ID or not RULES_SHEET_ID or not LOGS_SHEET_ID:
-        raise RuntimeError(
-            "IDs das planilhas nao configurados. Coloque em Secrets: "
-            "CONFIG_SHEET_ID, RULES_SHEET_ID, LOGS_SHEET_ID."
-        )
+CONFIG_SHEET_ID = normalize_sheet_id(_get_cfg("CONFIG_SHEET_ID", ""))
+RULES_SHEET_ID = normalize_sheet_id(_get_cfg("RULES_SHEET_ID", ""))
+LOGS_SHEET_ID = normalize_sheet_id(_get_cfg("LOGS_SHEET_ID", ""))
 
 
-def _retryable(fn, tries=6, base_sleep=0.8, max_sleep=10.0):
+def require_ids():
+    missing = [k for k, v in [("CONFIG_SHEET_ID", CONFIG_SHEET_ID), ("RULES_SHEET_ID", RULES_SHEET_ID), ("LOGS_SHEET_ID", LOGS_SHEET_ID)] if not v]
+    if missing:
+        raise RuntimeError(f"Secrets faltando: {', '.join(missing)}")
+
+
+def retryable(fn, tries=6, base_sleep=0.8, max_sleep=10.0):
     last = None
     for i in range(tries):
         try:
@@ -86,7 +73,7 @@ def _retryable(fn, tries=6, base_sleep=0.8, max_sleep=10.0):
             last = e
             msg = str(e)
             is_quota = ("429" in msg) or ("Quota exceeded" in msg) or ("RESOURCE_EXHAUSTED" in msg)
-            if not is_quota and i >= 1:
+            if (not is_quota) and i >= 1:
                 raise
             time.sleep(min(max_sleep, base_sleep * (2 ** i)))
     raise last
@@ -96,155 +83,239 @@ def _retryable(fn, tries=6, base_sleep=0.8, max_sleep=10.0):
 def gs_client():
     if "gcp_service_account" not in st.secrets:
         raise RuntimeError("Secrets precisa ter [gcp_service_account].")
-
     info = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
-@st.cache_data(ttl=900)
-def list_sheet_titles_cached(spreadsheet_id: str):
+def open_sheet(sheet_id: str):
     client = gs_client()
-    sid = normalize_sheet_id(spreadsheet_id)
+    return retryable(lambda: client.open_by_key(sheet_id))
+
+
+def list_tabs(sheet_id: str) -> List[str]:
+    sh = open_sheet(sheet_id)
+    return [ws.title for ws in sh.worksheets()]
+
+
+def pick_tab(sheet_id: str, candidates: List[str]) -> str:
+    titles = list_tabs(sheet_id)
+    s = set(titles)
+    for c in candidates:
+        if c in s:
+            return c
+    lower = {t.lower(): t for t in titles}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    raise RuntimeError(f"Nenhuma aba encontrada em {sheet_id}. Candidatas: {candidates}. Existentes: {titles}")
+
+
+def get_or_create_tab(sheet_id: str, title: str, rows=5000, cols=20):
+    sh = open_sheet(sheet_id)
 
     def _do():
-        sh = client.open_by_key(sid)
-        return [ws.title for ws in sh.worksheets()]
-
-    return _retryable(_do)
-
-
-def get_or_create_worksheet(spreadsheet_id: str, title: str, rows: int = 5000, cols: int = 20):
-    client = gs_client()
-    sid = normalize_sheet_id(spreadsheet_id)
-
-    def _do():
-        sh = client.open_by_key(sid)
         try:
             return sh.worksheet(title)
         except Exception:
             return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
-    return _retryable(_do)
+    return retryable(_do)
 
 
-def read_df(spreadsheet_id: str, worksheet_title: str, last_n: Optional[int] = None) -> pd.DataFrame:
-    client = gs_client()
-    sid = normalize_sheet_id(spreadsheet_id)
-
-    def _do():
-        sh = client.open_by_key(sid)
-        ws = sh.worksheet(worksheet_title)
-        values = ws.get_all_values()
-        if not values:
-            return pd.DataFrame()
-        header = values[0]
-        body = values[1:]
-        if last_n and last_n > 0 and last_n < len(body):
-            body = body[-last_n:]
-        return pd.DataFrame(body, columns=header)
-
-    return _retryable(_do)
+def read_all_values(sheet_id: str, tab: str) -> List[List[str]]:
+    sh = open_sheet(sheet_id)
+    ws = sh.worksheet(tab)
+    return retryable(lambda: ws.get_all_values())
 
 
-def append_row(spreadsheet_id: str, worksheet_title: str, row: list, header_if_empty: Optional[list] = None):
-    client = gs_client()
-    sid = normalize_sheet_id(spreadsheet_id)
-
-    def _do():
-        sh = client.open_by_key(sid)
-        ws = sh.worksheet(worksheet_title)
-        if header_if_empty:
-            first = ws.row_values(1)
-            if not first or all(str(x).strip() == "" for x in first):
-                ws.append_row(header_if_empty, value_input_option="RAW")
-        ws.append_row(row, value_input_option="RAW")
-
-    return _retryable(_do)
+def write_header_if_empty(ws, header: List[str]):
+    first = retryable(lambda: ws.row_values(1))
+    if (not first) or all(str(x).strip() == "" for x in first):
+        retryable(lambda: ws.append_row(header, value_input_option="RAW"))
 
 
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().lower() for c in df.columns]
+def append_row(sheet_id: str, tab: str, row: List[str], header_if_empty: Optional[List[str]] = None):
+    sh = open_sheet(sheet_id)
+    ws = sh.worksheet(tab)
+    if header_if_empty:
+        write_header_if_empty(ws, header_if_empty)
+    retryable(lambda: ws.append_row(row, value_input_option="RAW"))
+
+
+def norm_cols(cols: List[str]) -> List[str]:
+    out = []
+    for c in cols:
+        c2 = str(c).strip().lower()
+        c2 = c2.replace(" ", "_")
+        out.append(c2)
+    return out
+
+
+def to_df(values: List[List[str]]) -> pd.DataFrame:
+    if not values:
+        return pd.DataFrame()
+    header = values[0]
+    body = values[1:]
+    df = pd.DataFrame(body, columns=header)
+    df.columns = norm_cols(list(df.columns))
     return df
 
 
-def _coerce_bool(x) -> bool:
-    if pd.isna(x):
+def as_bool(x) -> bool:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return False
     s = str(x).strip().lower()
     return s in ["1", "true", "sim", "yes", "y", "ativo"]
 
 
-def _weekday_pt(d: date) -> str:
+def weekday_pt(d: date) -> str:
     names = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
     return names[d.weekday()]
 
 
-def _pick_first_existing_tab(spreadsheet_id: str, candidates: list[str]) -> str:
-    titles = set(list_sheet_titles_cached(spreadsheet_id))
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for c in candidates:
-        if c in titles:
+        if c in df.columns:
             return c
-    lower_map = {t.lower(): t for t in titles}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    raise RuntimeError(f"Nenhuma aba encontrada. Candidatas: {candidates}. Existentes: {sorted(titles)}")
+    return None
 
 
-def _validate_config(areas_df: pd.DataFrame, itens_df: pd.DataFrame):
-    for c in [COL_AREA_ID, COL_AREA_NOME]:
-        if c not in areas_df.columns:
-            raise RuntimeError(f"A aba AREAS precisa ter a coluna '{c}'. Colunas atuais: {list(areas_df.columns)}")
-
-    needed = {COL_AREA_REF, COL_TURNO, COL_ITEM_ID, COL_TEXTO}
-    missing = [c for c in needed if c not in itens_df.columns]
+def require_cols(df: pd.DataFrame, required: List[str], friendly: str):
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise RuntimeError(
-            f"A aba ITENS precisa ter as colunas {sorted(list(needed))}. "
-            f"Faltando: {missing}. Colunas atuais: {list(itens_df.columns)}"
-        )
+        raise RuntimeError(f"{friendly} faltando colunas: {missing}. Colunas atuais: {list(df.columns)}")
 
 
-def _areas_list(areas_df: pd.DataFrame) -> list[dict]:
-    df = areas_df.copy()
-    if COL_ATIVO in df.columns:
-        df = df[df[COL_ATIVO].apply(_coerce_bool) == True]
-    if COL_ORDEM in df.columns:
-        df[COL_ORDEM] = pd.to_numeric(df[COL_ORDEM], errors="coerce")
-        df = df.sort_values([COL_ORDEM, COL_AREA_NOME], na_position="last")
+def map_areas(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # mapear nomes comuns
+    ren = {}
+    c_id = pick_col(df, ["area_id", "area", "id_area"])
+    c_nm = pick_col(df, ["area_nome", "nome", "area_name"])
+    if c_id and c_id != "area_id":
+        ren[c_id] = "area_id"
+    if c_nm and c_nm != "area_nome":
+        ren[c_nm] = "area_nome"
+    if ren:
+        df = df.rename(columns=ren)
+
+    require_cols(df, ["area_id", "area_nome"], "Aba AREAS")
+    df["area_id"] = df["area_id"].astype(str).str.strip()
+    df["area_nome"] = df["area_nome"].astype(str).str.strip()
+
+    if "ativo" in df.columns:
+        df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
+    if "ordem" in df.columns:
+        df["ordem"] = pd.to_numeric(df["ordem"], errors="coerce")
+        df = df.sort_values(["ordem", "area_nome"], na_position="last")
     else:
-        df = df.sort_values([COL_AREA_NOME])
-    out = []
-    for _, r in df.iterrows():
-        out.append({"area_id": str(r[COL_AREA_ID]).strip(), "area_nome": str(r[COL_AREA_NOME]).strip()})
-    return out
-
-
-def _turnos_list(itens_df: pd.DataFrame) -> list[str]:
-    vals = sorted({str(x).strip() for x in itens_df[COL_TURNO].dropna().tolist() if str(x).strip()})
-    return vals if vals else ["Almoco", "Jantar"]
-
-
-def _items_for(itens_df: pd.DataFrame, area_id: str, turno: str) -> pd.DataFrame:
-    df = itens_df.copy()
-    df[COL_AREA_REF] = df[COL_AREA_REF].astype(str).str.strip()
-    df[COL_TURNO] = df[COL_TURNO].astype(str).str.strip()
-    df = df[(df[COL_AREA_REF] == area_id) & (df[COL_TURNO] == turno)]
-    if COL_ATIVO in df.columns:
-        df = df[df[COL_ATIVO].apply(_coerce_bool) == True]
-    if COL_ORDEM in df.columns:
-        df[COL_ORDEM] = pd.to_numeric(df[COL_ORDEM], errors="coerce")
-        df = df.sort_values([COL_ORDEM, COL_ITEM_ID], na_position="last")
-    else:
-        df = df.sort_values([COL_ITEM_ID])
-    df[COL_ITEM_ID] = df[COL_ITEM_ID].astype(str).str.strip()
-    df[COL_TEXTO] = df[COL_TEXTO].astype(str).str.strip()
+        df = df.sort_values(["area_nome"])
     return df.reset_index(drop=True)
 
 
-def _latest_status_today(events_df: pd.DataFrame, today_iso: str) -> dict:
+def map_itens(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    ren = {}
+
+    c_area = pick_col(df, ["area_id", "area", "id_area"])
+    c_turno = pick_col(df, ["turno", "shift"])
+    c_item = pick_col(df, ["item_id", "id_item", "id", "codigo"])
+    c_text = pick_col(df, ["texto", "item", "descricao", "atividade", "tarefa", "nome"])
+
+    if c_area and c_area != "area_id":
+        ren[c_area] = "area_id"
+    if c_turno and c_turno != "turno":
+        ren[c_turno] = "turno"
+    if c_item and c_item != "item_id":
+        ren[c_item] = "item_id"
+    if c_text and c_text != "texto":
+        ren[c_text] = "texto"
+
+    if ren:
+        df = df.rename(columns=ren)
+
+    require_cols(df, ["area_id", "turno", "item_id", "texto"], "Aba ITENS")
+
+    df["area_id"] = df["area_id"].astype(str).str.strip()
+    df["turno"] = df["turno"].astype(str).str.strip()
+    df["item_id"] = df["item_id"].astype(str).str.strip()
+    df["texto"] = df["texto"].astype(str).str.strip()
+
+    if "ativo" in df.columns:
+        df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
+    if "ordem" in df.columns:
+        df["ordem"] = pd.to_numeric(df["ordem"], errors="coerce")
+        df = df.sort_values(["area_id", "turno", "ordem", "item_id"], na_position="last")
+    else:
+        df = df.sort_values(["area_id", "turno", "item_id"])
+    return df.reset_index(drop=True)
+
+
+def map_users(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    ren = {}
+    c_login = pick_col(df, ["login", "user", "usuario"])
+    c_pass = pick_col(df, ["senha", "password", "pass"])
+    c_nome = pick_col(df, ["nome", "name"])
+    if c_login and c_login != "login":
+        ren[c_login] = "login"
+    if c_pass and c_pass != "senha":
+        ren[c_pass] = "senha"
+    if c_nome and c_nome != "nome":
+        ren[c_nome] = "nome"
+    if ren:
+        df = df.rename(columns=ren)
+
+    require_cols(df, ["login", "senha"], "Aba USUARIOS")
+    df["login"] = df["login"].astype(str).str.strip()
+    df["senha"] = df["senha"].astype(str).str.strip()
+    if "ativo" in df.columns:
+        df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=300)
+def load_config_tables(cache_buster: int) -> Dict[str, pd.DataFrame]:
+    require_ids()
+
+    ws_areas = pick_tab(CONFIG_SHEET_ID, WS_AREAS_CANDIDATES)
+    ws_itens = pick_tab(CONFIG_SHEET_ID, WS_ITENS_CANDIDATES)
+
+    areas_raw = to_df(read_all_values(CONFIG_SHEET_ID, ws_areas))
+    itens_raw = to_df(read_all_values(CONFIG_SHEET_ID, ws_itens))
+
+    areas = map_areas(areas_raw)
+    itens = map_itens(itens_raw)
+
+    return {"areas": areas, "itens": itens}
+
+
+@st.cache_data(ttl=300)
+def load_users_table(cache_buster: int) -> pd.DataFrame:
+    require_ids()
+    ws_users = pick_tab(RULES_SHEET_ID, WS_USERS_CANDIDATES)
+    users_raw = to_df(read_all_values(RULES_SHEET_ID, ws_users))
+    return map_users(users_raw)
+
+
+@st.cache_data(ttl=30)
+def load_events_last(cache_buster: int, last_rows: int = 2000) -> pd.DataFrame:
+    require_ids()
+    ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=10000, cols=20)
+    write_header_if_empty(ws, EVENTS_HEADER)
+
+    # ler tudo pode estourar quota, então vamos ler "tudo" mas com cache curto e refresh manual
+    values = retryable(lambda: ws.get_all_values())
+    df = to_df(values)
+    if df.empty:
+        return df
+    if len(df) > last_rows:
+        df = df.tail(last_rows).reset_index(drop=True)
+    return df
+
+
+def latest_status_map_for_day(events_df: pd.DataFrame, day_iso: str) -> Dict[Tuple[str, str, str], str]:
     if events_df.empty:
         return {}
     needed = {"data", "area_id", "turno", "item_id", "status", "ts_iso"}
@@ -253,14 +324,13 @@ def _latest_status_today(events_df: pd.DataFrame, today_iso: str) -> dict:
 
     df = events_df.copy()
     df["data"] = df["data"].astype(str).str.strip()
-    df = df[df["data"] == today_iso].copy()
+    df = df[df["data"] == day_iso].copy()
     if df.empty:
         return {}
 
     df["ts_dt"] = pd.to_datetime(df["ts_iso"], errors="coerce")
-    df = df.dropna(subset=["ts_dt"])
-    df = df.sort_values("ts_dt")
-    latest = df.groupby(["data", "area_id", "turno", "item_id"], as_index=False).tail(1)
+    df = df.dropna(subset=["ts_dt"]).sort_values("ts_dt")
+    latest = df.groupby(["area_id", "turno", "item_id"], as_index=False).tail(1)
 
     mp = {}
     for _, r in latest.iterrows():
@@ -269,55 +339,36 @@ def _latest_status_today(events_df: pd.DataFrame, today_iso: str) -> dict:
     return mp
 
 
-def _card_style(status: str) -> tuple[str, str]:
+def card_style(status: str) -> Tuple[str, str]:
     s = (status or "").strip().upper()
     if s == "OK":
         return "#d1fae5", "Concluido"
-    if s in ["NAO_OK", "NÃO OK", "NAO OK"]:
+    if s in ["NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
         return "#fee2e2", "Nao OK"
     return "#f3f4f6", "Pendente"
 
 
-def _invalidate_data_cache():
-    st.cache_data.clear()
+def write_event(user_login: str, user_nome: str, area_id: str, turno: str, item_id: str, texto: str, status: str, obs: str = ""):
+    now = datetime.now(TZ)
+    row = [
+        now.isoformat(),
+        now.date().isoformat(),
+        now.strftime("%H:%M:%S"),
+        weekday_pt(now.date()),
+        user_login,
+        user_nome,
+        area_id,
+        turno,
+        item_id,
+        texto,
+        status,
+        obs,
+    ]
+    append_row(LOGS_SHEET_ID, EVENTS_TAB, row, header_if_empty=EVENTS_HEADER)
+    st.session_state["cache_buster"] += 1
 
 
-@st.cache_data(ttl=60)
-def load_tables():
-    _require_ids()
-
-    ws_areas = _pick_first_existing_tab(CONFIG_SHEET_ID, WS_AREAS_CANDIDATES)
-    ws_itens = _pick_first_existing_tab(CONFIG_SHEET_ID, WS_ITENS_CANDIDATES)
-    ws_users = _pick_first_existing_tab(RULES_SHEET_ID, WS_USERS_CANDIDATES)
-
-    try:
-        ws_events = _pick_first_existing_tab(LOGS_SHEET_ID, WS_EVENTS_CANDIDATES)
-    except Exception:
-        ws = get_or_create_worksheet(LOGS_SHEET_ID, "EVENTS", rows=5000, cols=20)
-        ws_events = ws.title
-        # header
-        existing = ws.row_values(1)
-        if not existing or all(str(x).strip() == "" for x in existing):
-            ws.append_row(EVENT_COLS, value_input_option="RAW")
-
-    areas_df = _normalize_cols(read_df(CONFIG_SHEET_ID, ws_areas))
-    itens_df = _normalize_cols(read_df(CONFIG_SHEET_ID, ws_itens))
-    users_df = _normalize_cols(read_df(RULES_SHEET_ID, ws_users))
-    events_df = _normalize_cols(read_df(LOGS_SHEET_ID, ws_events, last_n=1500))
-
-    return {
-        "ws_areas": ws_areas,
-        "ws_itens": ws_itens,
-        "ws_users": ws_users,
-        "ws_events": ws_events,
-        "areas_df": areas_df,
-        "itens_df": itens_df,
-        "users_df": users_df,
-        "events_df": events_df,
-    }
-
-
-def authenticate_user(users_df: pd.DataFrame):
+def authenticate(users_df: pd.DataFrame) -> Optional[Dict[str, str]]:
     st.session_state.setdefault("logged_in", False)
     st.session_state.setdefault("user_login", "")
     st.session_state.setdefault("user_nome", "")
@@ -328,55 +379,20 @@ def authenticate_user(users_df: pd.DataFrame):
     st.title("Login")
     st.caption("Acesso protegido por usuario e senha.")
 
-    u = st.text_input("Usuario", key="login_user")
-    p = st.text_input("Senha", type="password", key="login_pass")
+    u = st.text_input("Usuario", key="u")
+    p = st.text_input("Senha", type="password", key="p")
 
     if st.button("Entrar", type="primary"):
-        if users_df.empty:
-            st.error("A aba de usuarios esta vazia.")
-            return None
-
-        df = users_df.copy()
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-        col_login = None
-        for c in ["login", "user", "usuario"]:
-            if c in df.columns:
-                col_login = c
-                break
-
-        col_pass = None
-        for c in ["senha", "password"]:
-            if c in df.columns:
-                col_pass = c
-                break
-
-        col_nome = "nome" if "nome" in df.columns else None
-        col_ativo = "ativo" if "ativo" in df.columns else None
-
-        if not col_login or not col_pass:
-            st.error("A aba de usuarios precisa ter colunas login/senha (ou user/password).")
-            st.info(f"Colunas encontradas: {list(df.columns)}")
-            return None
-
-        if col_ativo:
-            tmp = df[col_ativo].astype(str).str.strip().str.lower()
-            df = df[tmp.isin(["true", "1", "sim", "yes", "ativo"])]
-
         u2 = str(u).strip()
         p2 = str(p).strip()
-
-        df[col_login] = df[col_login].astype(str).str.strip()
-        df[col_pass] = df[col_pass].astype(str).str.strip()
-
-        hit = df[(df[col_login] == u2) & (df[col_pass] == p2)]
+        hit = users_df[(users_df["login"] == u2) & (users_df["senha"] == p2)]
         if hit.empty:
             st.error("Usuario ou senha invalidos.")
             return None
 
         nome = u2
-        if col_nome:
-            nome = str(hit.iloc[0][col_nome]).strip() or u2
+        if "nome" in hit.columns:
+            nome = str(hit.iloc[0]["nome"]).strip() or u2
 
         st.session_state["logged_in"] = True
         st.session_state["user_login"] = u2
@@ -386,128 +402,101 @@ def authenticate_user(users_df: pd.DataFrame):
     return None
 
 
-def write_event(area_id: str, turno: str, item_id: str, texto: str, status: str, user_login: str, user_nome: str, ws_events: str):
-    now = datetime.now(TZ)
-    row = [
-        now.isoformat(),
-        now.date().isoformat(),
-        now.strftime("%H:%M:%S"),
-        _weekday_pt(now.date()),
-        user_login,
-        user_nome,
-        area_id,
-        turno,
-        item_id,
-        texto,
-        status,
-    ]
-    append_row(LOGS_SHEET_ID, ws_events, row, header_if_empty=EVENT_COLS)
-    _invalidate_data_cache()
-
-
-def page_dashboard(tables):
+def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
     st.subheader("Dashboard operacional")
 
-    areas_df = tables["areas_df"]
-    itens_df = tables["itens_df"]
-    events_df = tables["events_df"]
-
-    _validate_config(areas_df, itens_df)
+    areas = cfg["areas"]
+    itens = cfg["itens"]
 
     today = datetime.now(TZ).date().isoformat()
-    status_map = _latest_status_today(events_df, today)
+    mp = latest_status_map_for_day(events_df, today)
 
-    areas = _areas_list(areas_df)
-    turnos = _turnos_list(itens_df)
+    if st.button("Atualizar agora"):
+        st.session_state["cache_buster"] += 1
+        st.rerun()
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Atualizar dados agora"):
-            _invalidate_data_cache()
-            st.rerun()
-    with c2:
-        st.caption("Sem auto refresh para evitar erro 429. Use o botao quando precisar.")
+    turnos = sorted(itens["turno"].dropna().astype(str).str.strip().unique().tolist())
 
-    for a in areas:
-        st.markdown(f"### {a['area_nome']}")
+    for _, a in areas.iterrows():
+        area_id = str(a["area_id"]).strip()
+        area_nome = str(a["area_nome"]).strip()
+
+        st.markdown(f"### {area_nome}")
+
         cols = st.columns(2 if len(turnos) >= 2 else 1)
-
-        for idx, turno in enumerate(turnos):
-            items = _items_for(itens_df, a["area_id"], turno)
-            total = len(items)
-
-            done = 0
+        for i, turno in enumerate(turnos):
+            df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno)].copy()
+            total = len(df_items)
+            ok = 0
             nok = 0
-            for _, it in items.iterrows():
-                stt = status_map.get((a["area_id"], turno, str(it[COL_ITEM_ID]).strip()), "PENDENTE")
+            for _, it in df_items.iterrows():
+                key = (area_id, turno, str(it["item_id"]).strip())
+                stt = mp.get(key, "PENDENTE")
                 if stt == "OK":
-                    done += 1
-                elif stt in ["NAO_OK", "NÃO OK", "NAO OK"]:
+                    ok += 1
+                elif stt in ["NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
                     nok += 1
 
-            pct = (done / total) if total else 0.0
-            subtitle = f"{done}/{total} OK | {nok} Nao OK"
+            pct = int(round((ok / total) * 100, 0)) if total else 0
 
-            color = "#2b2b2b"
-            if done == total and total > 0:
-                color = "#0b6a5a"
-            elif done > 0:
-                color = "#8b6b12"
+            bg = "#0b6a5a" if (total > 0 and ok == total) else "#1f2937"
             if nok > 0:
-                color = "#7a1f2b"
+                bg = "#7a1f2b"
+            elif ok > 0 and ok < total:
+                bg = "#8b6b12"
 
-            with cols[idx % len(cols)]:
+            with cols[i % len(cols)]:
                 st.markdown(
                     f"""
-                    <div style="border-radius:16px;padding:14px;margin:8px 0;background:{color};color:white;">
+                    <div style="border-radius:16px;padding:14px;margin:8px 0;background:{bg};color:white;">
                       <div style="font-size:16px;font-weight:800;">{turno}</div>
-                      <div style="font-size:13px;opacity:0.9;margin-top:4px;">{subtitle}</div>
-                      <div style="font-size:22px;font-weight:900;margin-top:10px;">{int(round(pct*100,0))}%</div>
+                      <div style="font-size:13px;opacity:0.9;margin-top:4px;">OK {ok}/{total} | Nao OK {nok}</div>
+                      <div style="font-size:22px;font-weight:900;margin-top:10px;">{pct}%</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
 
 
-def page_checklist(tables, user_login: str, user_nome: str):
+def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: Dict[str, str]):
     st.subheader("Checklist")
 
-    areas_df = tables["areas_df"]
-    itens_df = tables["itens_df"]
-    events_df = tables["events_df"]
-    ws_events = tables["ws_events"]
-
-    _validate_config(areas_df, itens_df)
-
-    areas = _areas_list(areas_df)
-    turnos = _turnos_list(itens_df)
-
-    area_labels = [f"{a['area_nome']} ({a['area_id']})" for a in areas]
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        area_sel = st.selectbox("Area", area_labels, index=0)
-    with c2:
-        turno_sel = st.selectbox("Turno", turnos, index=0)
-
-    area_id = area_sel.split("(")[-1].replace(")", "").strip()
-    items = _items_for(itens_df, area_id, turno_sel)
-    if items.empty:
-        st.warning("Sem itens para esta Area e Turno.")
-        return
+    areas = cfg["areas"]
+    itens = cfg["itens"]
 
     today = datetime.now(TZ).date().isoformat()
-    status_map = _latest_status_today(events_df, today)
+    mp = latest_status_map_for_day(events_df, today)
 
-    st.markdown(f"### {area_sel} | {turno_sel}")
-    st.caption("Tudo comeca PENDENTE. Clique OK ou Nao OK. Para desfazer, clique Desmarcar.")
+    areas_labels = [f"{r['area_nome']} ({r['area_id']})" for _, r in areas.iterrows()]
+    area_sel = st.selectbox("Area", areas_labels, index=0)
 
-    for _, it in items.iterrows():
-        item_id = str(it[COL_ITEM_ID]).strip()
-        texto = str(it[COL_TEXTO]).strip()
+    area_id = area_sel.split("(")[-1].replace(")", "").strip()
 
-        current = status_map.get((area_id, turno_sel, item_id), "PENDENTE").upper()
-        bg, label = _card_style(current)
+    turnos = sorted(itens[itens["area_id"] == area_id]["turno"].dropna().astype(str).str.strip().unique().tolist())
+    if not turnos:
+        st.warning("Sem turnos para esta area na ITENS.")
+        return
+
+    turno_sel = st.selectbox("Turno", turnos, index=0)
+
+    df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno_sel)].copy()
+    if df_items.empty:
+        st.warning("Sem itens para esta combinacao.")
+        return
+
+    st.caption("Tudo comeca PENDENTE. Clique OK, Nao OK ou Desmarcar.")
+
+    if st.button("Atualizar lista"):
+        st.session_state["cache_buster"] += 1
+        st.rerun()
+
+    for _, it in df_items.iterrows():
+        item_id = str(it["item_id"]).strip()
+        texto = str(it["texto"]).strip()
+        key = (area_id, turno_sel, item_id)
+        status = mp.get(key, "PENDENTE").upper()
+
+        bg, label = card_style(status)
 
         st.markdown(
             f"""
@@ -519,63 +508,46 @@ def page_checklist(tables, user_login: str, user_nome: str):
             unsafe_allow_html=True,
         )
 
-        b1, b2, b3 = st.columns([1, 1, 1])
+        c1, c2, c3 = st.columns([1, 1, 1])
 
-        with b1:
+        with c1:
             if st.button("OK", key=f"ok_{area_id}_{turno_sel}_{item_id}", type="primary"):
-                write_event(area_id, turno_sel, item_id, texto, "OK", user_login, user_nome, ws_events)
+                write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "OK")
                 st.rerun()
 
-        with b2:
+        with c2:
             if st.button("Nao OK", key=f"nok_{area_id}_{turno_sel}_{item_id}"):
-                write_event(area_id, turno_sel, item_id, texto, "NAO_OK", user_login, user_nome, ws_events)
+                write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "NAO_OK")
                 st.rerun()
 
-        with b3:
+        with c3:
             if st.button("Desmarcar", key=f"rst_{area_id}_{turno_sel}_{item_id}"):
-                write_event(area_id, turno_sel, item_id, texto, "PENDENTE", user_login, user_nome, ws_events)
+                write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "PENDENTE")
                 st.rerun()
 
 
-def page_events(tables):
+def page_events(events_df: pd.DataFrame):
     st.subheader("EVENTS")
     if st.button("Atualizar EVENTS"):
-        _invalidate_data_cache()
+        st.session_state["cache_buster"] += 1
         st.rerun()
-
-    df = tables["events_df"].copy()
-    if df.empty:
-        st.info("Sem eventos ainda.")
-        return
-
-    if "ts_iso" in df.columns:
-        df["ts_dt"] = pd.to_datetime(df["ts_iso"], errors="coerce")
-        df = df.sort_values("ts_dt", ascending=False).drop(columns=["ts_dt"], errors="ignore")
-
-    st.dataframe(df, use_container_width=True, height=520)
+    st.dataframe(events_df, use_container_width=True, height=560)
 
 
 def main():
-    st.set_page_config(page_title="Checklist Operacional", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="Checklist Operacional", layout="wide")
 
-    css = """
-    <style>
-    .block-container { padding-top: 1.2rem; padding-left: 0.9rem; padding-right: 0.9rem; }
-    header[data-testid="stHeader"] { height: 0px !important; }
-    div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
-    footer { visibility: hidden; height: 0px; }
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
-
-    _require_ids()
+    st.session_state.setdefault("cache_buster", 1)
+    require_ids()
 
     with st.sidebar:
         st.markdown("## Checklist Operacional")
 
         if st.button("Logout"):
             for k in list(st.session_state.keys()):
-                st.session_state.pop(k, None)
+                if k not in ["cache_buster"]:
+                    st.session_state.pop(k, None)
+            st.session_state["cache_buster"] += 1
             st.rerun()
 
         st.markdown("### Status")
@@ -589,18 +561,21 @@ def main():
         st.session_state.setdefault("nav", "Dashboard")
         st.radio("Ir para", ["Dashboard", "Checklist", "EVENTS"], key="nav", label_visibility="collapsed")
 
-    tables = load_tables()
-    user = authenticate_user(tables["users_df"])
+    cfg = load_config_tables(st.session_state["cache_buster"])
+    users_df = load_users_table(st.session_state["cache_buster"])
+    events_df = load_events_last(st.session_state["cache_buster"], last_rows=2000)
+
+    user = authenticate(users_df)
     if not user:
         return
 
     nav = st.session_state.get("nav", "Dashboard")
     if nav == "Checklist":
-        page_checklist(tables, user_login=user["login"], user_nome=user["nome"])
+        page_checklist(cfg, events_df, user)
     elif nav == "EVENTS":
-        page_events(tables)
+        page_events(events_df)
     else:
-        page_dashboard(tables)
+        page_dashboard(cfg, events_df)
 
 
 if __name__ == "__main__":
