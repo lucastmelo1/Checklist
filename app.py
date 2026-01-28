@@ -1,781 +1,759 @@
-# app.py
-# Checklist Operacional (Streamlit + Google Sheets)
-# Funciona com secrets antigos (CONFIG_SHEET_ID/RULES_SHEET_ID/LOGS_SHEET_ID) e também com [app] (opcional).
-# Usa service account em [gcp_service_account] (como você já tem).
-#
-# Estrutura esperada (flexível, por nomes de colunas):
-# 1) Checklist_Config (CONFIG_SHEET_ID)
-#    - Aba AREAS: area_id, area_nome, ativo, ordem
-#    - Aba ITENS: (colunas mínimas) item_id, item_texto (ou texto), area_id, turno, ordem
-#      + opcionais: critico, tipo_resposta (OK, Nao OK | NUMERO | TEXTO), min, deadline_hhmm
-# 2) App_Regras (RULES_SHEET_ID)
-#    - Aba USUARIOS: user_id, nome, login, senha, ativo, perfil
-# 3) Checklist_Logs (LOGS_SHEET_ID)
-#    - Aba LOGS: data, hora, dia_semana, user_login, user_nome, area_id, turno, item_id, texto, status, obs
-#
-# Status válidos: PENDENTE, OK, NAO_OK
-# Atraso é calculado (não gravado): se status PENDENTE e deadline_hhmm já passou para a data selecionada.
-
+import os
 import re
 import time
-from dataclasses import dataclass
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 import streamlit as st
-
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+
+TZ = ZoneInfo("America/Sao_Paulo")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+EVENTS_TAB = "EVENTS"
+EVENTS_HEADER = [
+    "ts_iso",
+    "data",
+    "hora",
+    "dia_semana",
+    "user_login",
+    "user_nome",
+    "area_id",
+    "turno",
+    "item_id",
+    "texto",
+    "status",
+    "obs",
+]
+
+WS_AREAS_CANDIDATES = ["AREAS", "Areas", "areas"]
+WS_ITENS_CANDIDATES = ["ITENS", "Itens", "itens"]
+WS_USERS_CANDIDATES = ["USUARIOS", "Usuarios", "usuarios", "USERS", "Users", "users"]
 
 
-# =========================
-# Config e helpers
-# =========================
-
-APP_TITLE = "Checklist Operacional"
-
-WS_AREAS_CANDIDATES = ["AREAS", "ÁREAS", "AREAS ", "areas"]
-WS_ITENS_CANDIDATES = ["ITENS", "ITEMS", "itens"]
-WS_USUARIOS_CANDIDATES = ["USUARIOS", "USUÁRIOS", "USERS", "LOGIN", "usuarios"]
-WS_LOGS_CANDIDATES = ["LOGS", "LOG", "REGISTROS", "records"]
-
-STATUS_OK = "OK"
-STATUS_NAO_OK = "NAO_OK"
-STATUS_PENDENTE = "PENDENTE"
-
-TZ_NOTE = "America/Sao_Paulo"
+def _get_cfg(name: str, default: str = "") -> str:
+    if hasattr(st, "secrets") and name in st.secrets:
+        return str(st.secrets[name]).strip()
+    if hasattr(st, "secrets") and "app" in st.secrets and name in st.secrets["app"]:
+        return str(st.secrets["app"][name]).strip()
+    return os.getenv(name, default).strip()
 
 
-def _norm(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip()
-    s = s.replace("\u00a0", " ")
-    return s
+def normalize_sheet_id(value: str) -> str:
+    v = (value or "").strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", v)
+    return m.group(1) if m else v
 
 
-def _norm_key(s: str) -> str:
-    s = _norm(s).lower()
-    s = re.sub(r"\s+", "_", s)
-    s = s.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("à", "a").replace("â", "a")
-    s = s.replace("é", "e").replace("ê", "e")
-    s = s.replace("í", "i")
-    s = s.replace("ó", "o").replace("ô", "o").replace("õ", "o")
-    s = s.replace("ú", "u")
-    return s
+CONFIG_SHEET_ID = normalize_sheet_id(_get_cfg("CONFIG_SHEET_ID", ""))
+RULES_SHEET_ID = normalize_sheet_id(_get_cfg("RULES_SHEET_ID", ""))
+LOGS_SHEET_ID = normalize_sheet_id(_get_cfg("LOGS_SHEET_ID", ""))
 
 
-def _col(df: pd.DataFrame, *cands: str) -> str | None:
-    # retorna o nome real da coluna que bate com algum candidato (case/acentos/underscore)
-    if df is None or df.empty:
-        return None
-    mapping = { _norm_key(c): c for c in df.columns }
-    for c in cands:
-        k = _norm_key(c)
-        if k in mapping:
-            return mapping[k]
+def require_ids():
+    missing = [
+        k for k, v in [
+            ("CONFIG_SHEET_ID", CONFIG_SHEET_ID),
+            ("RULES_SHEET_ID", RULES_SHEET_ID),
+            ("LOGS_SHEET_ID", LOGS_SHEET_ID),
+        ]
+        if not v
+    ]
+    if missing:
+        raise RuntimeError(f"Secrets faltando: {', '.join(missing)}")
+
+
+def retryable(fn, tries=6, base_sleep=0.8, max_sleep=10.0):
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except APIError as e:
+            last = e
+            msg = str(e)
+            is_quota = ("429" in msg) or ("Quota exceeded" in msg) or ("RESOURCE_EXHAUSTED" in msg)
+            if (not is_quota) and i >= 1:
+                raise
+            time.sleep(min(max_sleep, base_sleep * (2 ** i)))
+    raise last
+
+
+@st.cache_resource
+def gs_client():
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Secrets precisa ter [gcp_service_account].")
+    info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+def open_sheet(sheet_id: str):
+    client = gs_client()
+    return retryable(lambda: client.open_by_key(sheet_id))
+
+
+def list_tabs(sheet_id: str) -> List[str]:
+    sh = open_sheet(sheet_id)
+    return [ws.title for ws in sh.worksheets()]
+
+
+def pick_tab(sheet_id: str, candidates: List[str]) -> str:
+    titles = list_tabs(sheet_id)
+    s = set(titles)
+    for c in candidates:
+        if c in s:
+            return c
+    lower = {t.lower(): t for t in titles}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    raise RuntimeError(f"Nenhuma aba encontrada em {sheet_id}. Candidatas: {candidates}. Existentes: {titles}")
+
+
+def get_or_create_tab(sheet_id: str, title: str, rows=5000, cols=30):
+    sh = open_sheet(sheet_id)
+
+    def _do():
+        try:
+            return sh.worksheet(title)
+        except Exception:
+            return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
+    return retryable(_do)
+
+
+def read_all_values(sheet_id: str, tab: str) -> List[List[str]]:
+    sh = open_sheet(sheet_id)
+    ws = sh.worksheet(tab)
+    return retryable(lambda: ws.get_all_values())
+
+
+def write_header_if_empty(ws, header: List[str]):
+    first = retryable(lambda: ws.row_values(1))
+    if (not first) or all(str(x).strip() == "" for x in first):
+        retryable(lambda: ws.append_row(header, value_input_option="RAW"))
+
+
+def append_row(sheet_id: str, tab: str, row: List[str], header_if_empty: Optional[List[str]] = None):
+    sh = open_sheet(sheet_id)
+    ws = sh.worksheet(tab)
+    if header_if_empty:
+        write_header_if_empty(ws, header_if_empty)
+    retryable(lambda: ws.append_row(row, value_input_option="RAW"))
+
+
+def norm_cols(cols: List[str]) -> List[str]:
+    out = []
+    for c in cols:
+        c2 = str(c).strip().lower()
+        c2 = c2.replace(" ", "_")
+        c2 = c2.replace("-", "_")
+        out.append(c2)
+    return out
+
+
+def to_df(values: List[List[str]]) -> pd.DataFrame:
+    if not values:
+        return pd.DataFrame()
+    header = values[0]
+    body = values[1:]
+    df = pd.DataFrame(body, columns=header)
+    df.columns = norm_cols(list(df.columns))
+    return df
+
+
+def as_bool(x) -> bool:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return False
+    s = str(x).strip().lower()
+    return s in ["1", "true", "sim", "yes", "y", "ativo"]
+
+
+def weekday_pt(d: date) -> str:
+    names = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
+    return names[d.weekday()]
+
+
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
     return None
 
 
-def _parse_bool(x) -> bool:
-    if isinstance(x, bool):
-        return x
-    s = _norm(x).lower()
-    if s in ["true", "1", "sim", "yes", "y"]:
-        return True
-    if s in ["false", "0", "nao", "não", "no", "n", ""]:
-        return False
-    return False
+def require_cols(df: pd.DataFrame, required: List[str], friendly: str):
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{friendly} faltando colunas: {missing}. Colunas atuais: {list(df.columns)}")
 
 
-def parse_hhmm(hhmm: str):
-    hhmm = _norm(hhmm)
-    if not hhmm:
+def map_areas(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    ren = {}
+    c_id = pick_col(df, ["area_id", "area", "id_area"])
+    c_nm = pick_col(df, ["area_nome", "nome", "area_name"])
+    if c_id and c_id != "area_id":
+        ren[c_id] = "area_id"
+    if c_nm and c_nm != "area_nome":
+        ren[c_nm] = "area_nome"
+    if ren:
+        df = df.rename(columns=ren)
+
+    require_cols(df, ["area_id", "area_nome"], "Aba AREAS")
+    df["area_id"] = df["area_id"].astype(str).str.strip()
+    df["area_nome"] = df["area_nome"].astype(str).str.strip()
+
+    if "ativo" in df.columns:
+        df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
+    if "ordem" in df.columns:
+        df["ordem"] = pd.to_numeric(df["ordem"], errors="coerce")
+        df = df.sort_values(["ordem", "area_nome"], na_position="last")
+    else:
+        df = df.sort_values(["area_nome"])
+    return df.reset_index(drop=True)
+
+
+def _clean_hhmm(x: str) -> str:
+    s = str(x or "").strip()
+    if not s:
+        return ""
+    m = re.match(r"^(\d{1,2})[:h]?(\d{2})$", s.lower())
+    if not m:
+        return ""
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return ""
+    return f"{hh:02d}:{mm:02d}"
+
+
+def map_itens(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    ren = {}
+
+    c_area = pick_col(df, ["area_id", "area", "id_area"])
+    c_turno = pick_col(df, ["turno", "shift"])
+    c_item = pick_col(df, ["item_id", "id_item", "id", "codigo"])
+    c_text = pick_col(df, ["texto", "item", "descricao", "atividade", "tarefa", "nome"])
+    c_dead = pick_col(df, ["deadline_hhmm", "deadline", "horario", "hora", "prazo", "horario_hhmm"])
+
+    if c_area and c_area != "area_id":
+        ren[c_area] = "area_id"
+    if c_turno and c_turno != "turno":
+        ren[c_turno] = "turno"
+    if c_item and c_item != "item_id":
+        ren[c_item] = "item_id"
+    if c_text and c_text != "texto":
+        ren[c_text] = "texto"
+    if c_dead and c_dead != "deadline_hhmm":
+        ren[c_dead] = "deadline_hhmm"
+
+    if ren:
+        df = df.rename(columns=ren)
+
+    require_cols(df, ["area_id", "turno", "item_id", "texto"], "Aba ITENS")
+
+    df["area_id"] = df["area_id"].astype(str).str.strip()
+    df["turno"] = df["turno"].astype(str).str.strip()
+    df["item_id"] = df["item_id"].astype(str).str.strip()
+    df["texto"] = df["texto"].astype(str).str.strip()
+
+    if "deadline_hhmm" in df.columns:
+        df["deadline_hhmm"] = df["deadline_hhmm"].apply(_clean_hhmm)
+
+    if "ativo" in df.columns:
+        df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
+    if "ordem" in df.columns:
+        df["ordem"] = pd.to_numeric(df["ordem"], errors="coerce")
+        df = df.sort_values(["area_id", "turno", "ordem", "item_id"], na_position="last")
+    else:
+        df = df.sort_values(["area_id", "turno", "item_id"])
+    return df.reset_index(drop=True)
+
+
+def map_users(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    ren = {}
+    c_login = pick_col(df, ["login", "user", "usuario"])
+    c_pass = pick_col(df, ["senha", "password", "pass"])
+    c_nome = pick_col(df, ["nome", "name"])
+    if c_login and c_login != "login":
+        ren[c_login] = "login"
+    if c_pass and c_pass != "senha":
+        ren[c_pass] = "senha"
+    if c_nome and c_nome != "nome":
+        ren[c_nome] = "nome"
+    if ren:
+        df = df.rename(columns=ren)
+
+    require_cols(df, ["login", "senha"], "Aba USUARIOS")
+    df["login"] = df["login"].astype(str).str.strip()
+    df["senha"] = df["senha"].astype(str).str.strip()
+    if "ativo" in df.columns:
+        df = df[df["ativo"].apply(as_bool) | (df["ativo"].astype(str).str.strip() == "")]
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=300)
+def load_config_tables(cache_buster: int) -> Dict[str, pd.DataFrame]:
+    require_ids()
+    ws_areas = pick_tab(CONFIG_SHEET_ID, WS_AREAS_CANDIDATES)
+    ws_itens = pick_tab(CONFIG_SHEET_ID, WS_ITENS_CANDIDATES)
+
+    areas_raw = to_df(read_all_values(CONFIG_SHEET_ID, ws_areas))
+    itens_raw = to_df(read_all_values(CONFIG_SHEET_ID, ws_itens))
+
+    areas = map_areas(areas_raw)
+    itens = map_itens(itens_raw)
+
+    return {"areas": areas, "itens": itens}
+
+
+@st.cache_data(ttl=300)
+def load_users_table(cache_buster: int) -> pd.DataFrame:
+    require_ids()
+    ws_users = pick_tab(RULES_SHEET_ID, WS_USERS_CANDIDATES)
+    users_raw = to_df(read_all_values(RULES_SHEET_ID, ws_users))
+    return map_users(users_raw)
+
+
+@st.cache_data(ttl=30)
+def load_events_last(cache_buster: int, last_rows: int = 2000) -> pd.DataFrame:
+    require_ids()
+    ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=20000, cols=30)
+    write_header_if_empty(ws, EVENTS_HEADER)
+
+    values = retryable(lambda: ws.get_all_values())
+    df = to_df(values)
+    if df.empty:
+        return df
+    if len(df) > last_rows:
+        df = df.tail(last_rows).reset_index(drop=True)
+    return df
+
+
+def latest_status_map_for_day(events_df: pd.DataFrame, day_iso: str) -> Dict[Tuple[str, str, str], str]:
+    if events_df.empty:
+        return {}
+    needed = {"data", "area_id", "turno", "item_id", "status", "ts_iso"}
+    if any(c not in events_df.columns for c in needed):
+        return {}
+
+    df = events_df.copy()
+    df["data"] = df["data"].astype(str).str.strip()
+    df = df[df["data"] == day_iso].copy()
+    if df.empty:
+        return {}
+
+    df["ts_dt"] = pd.to_datetime(df["ts_iso"], errors="coerce")
+    df = df.dropna(subset=["ts_dt"]).sort_values("ts_dt")
+    latest = df.groupby(["area_id", "turno", "item_id"], as_index=False).tail(1)
+
+    mp = {}
+    for _, r in latest.iterrows():
+        key = (str(r["area_id"]).strip(), str(r["turno"]).strip(), str(r["item_id"]).strip())
+        mp[key] = str(r["status"]).strip().upper()
+    return mp
+
+
+def parse_deadline_for_day(day_iso: str, hhmm: str) -> Optional[datetime]:
+    s = str(hhmm or "").strip()
+    if not s:
         return None
-    m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm)
+    m = re.match(r"^(\d{2}):(\d{2})$", s)
     if not m:
         return None
     hh = int(m.group(1))
     mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+    d = datetime.fromisoformat(day_iso).date()
+    return datetime(d.year, d.month, d.day, hh, mm, 0, tzinfo=TZ)
+
+
+def compute_item_effective_status_for_day(day_iso: str, raw_status: str, deadline_hhmm: str) -> str:
+    s = (raw_status or "").strip().upper()
+    if s in ["OK", "NAO_OK", "NÃO_OK", "NÃO OK", "NAO OK"]:
+        return "NAO_OK" if ("NAO" in s or "NÃO" in s) else "OK"
+
+    dl = parse_deadline_for_day(day_iso, deadline_hhmm)
+
+    if dl is None:
+        return "PENDENTE"
+
+    now = datetime.now(TZ)
+    day_d = datetime.fromisoformat(day_iso).date()
+    today_d = now.date()
+
+    if day_d > today_d:
+        return "PENDENTE"
+
+    if day_d < today_d:
+        return "ATRASADO"
+
+    if now > dl:
+        return "ATRASADO"
+    return "PENDENTE"
+
+
+def card_palette(effective_status: str) -> Tuple[str, str]:
+    s = (effective_status or "").strip().upper()
+    if s == "OK":
+        return "#d1fae5", "Concluido"
+    if s == "NAO_OK":
+        return "#fee2e2", "Nao OK"
+    if s == "ATRASADO":
+        return "#ffedd5", "Atrasado"
+    return "#f3f4f6", "Pendente"
+
+
+def _norm_tipo_resposta(x: str) -> str:
+    s = str(x or "").strip().upper()
+    s = s.replace("NÃO", "NAO")
+    if "NUMERO" in s:
+        return "NUMERO"
+    if "TEXTO" in s:
+        return "TEXTO"
+    return "OK_NAOOK"
+
+
+def _safe_float(x: str) -> Optional[float]:
+    s = str(x or "").strip().replace(",", ".")
+    if not s:
         return None
-    return hh, mm
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
-def now_dt() -> datetime:
-    # Streamlit Cloud geralmente roda em UTC. Para reduzir surpresa, usamos hora local via offset simples.
-    # Se você quiser precisão absoluta por timezone, dá para usar zoneinfo.
-    # Aqui: usa datetime.now() do ambiente e mantém coerente com o que aparece nos logs atuais.
-    return datetime.now()
-
-
-def weekday_pt_br(dt: date) -> str:
-    dias = ["Segunda", "Terca", "Quarta", "Quinta", "Sexta", "Sabado", "Domingo"]
-    return dias[dt.weekday()]
-
-
-def is_overdue(selected_date: date, deadline_hhmm: str, status_atual: str) -> bool:
-    if status_atual != STATUS_PENDENTE:
-        return False
-    parsed = parse_hhmm(deadline_hhmm)
-    if not parsed:
-        return False
-
-    hh, mm = parsed
-    n = now_dt()
-
-    # Se a data selecionada for hoje, compara hora atual.
-    # Se a data selecionada for no passado, qualquer pendente com deadline é atrasado.
-    # Se a data selecionada for no futuro, não marca atraso.
-    if selected_date < n.date():
-        return True
-    if selected_date > n.date():
-        return False
-
-    return (n.hour, n.minute) >= (hh, mm)
-
-
-# =========================
-# Secrets compatível
-# =========================
-
-def _get_sheet_ids():
-    """
-    Compatível com secrets antigos e novos.
-    Não exige [app].
-    """
-    app_cfg = st.secrets.get("app", {})
-    if app_cfg:
-        config_id = str(app_cfg.get("config_sheet_id", "")).strip()
-        rules_id = str(app_cfg.get("rules_sheet_id", "")).strip()
-        logs_id = str(app_cfg.get("logs_sheet_id", "")).strip()
-        if config_id and rules_id and logs_id:
-            return config_id, rules_id, logs_id
-
-    candidates = [
-        ("CONFIG_SHEET_ID", "RULES_SHEET_ID", "LOGS_SHEET_ID"),
-        ("config_sheet_id", "rules_sheet_id", "logs_sheet_id"),
-        ("CHECKLIST_CONFIG_SHEET_ID", "APP_REGRAS_SHEET_ID", "CHECKLIST_LOGS_SHEET_ID"),
+def write_event(
+    user_login: str,
+    user_nome: str,
+    area_id: str,
+    turno: str,
+    item_id: str,
+    texto: str,
+    status: str,
+    obs: str = "",
+):
+    now = datetime.now(TZ)
+    row = [
+        now.isoformat(),
+        now.date().isoformat(),
+        now.strftime("%H:%M:%S"),
+        weekday_pt(now.date()),
+        user_login,
+        user_nome,
+        area_id,
+        turno,
+        item_id,
+        texto,
+        status,
+        obs,
     ]
-    for a, b, c in candidates:
-        config_id = str(st.secrets.get(a, "")).strip()
-        rules_id = str(st.secrets.get(b, "")).strip()
-        logs_id = str(st.secrets.get(c, "")).strip()
-        if config_id and rules_id and logs_id:
-            return config_id, rules_id, logs_id
-
-    st.error(
-        "Não encontrei os IDs das planilhas no secrets. "
-        "Procurei por [app].config_sheet_id/rules_sheet_id/logs_sheet_id e também por "
-        "CONFIG_SHEET_ID/RULES_SHEET_ID/LOGS_SHEET_ID (e variações)."
-    )
-    st.stop()
+    append_row(LOGS_SHEET_ID, EVENTS_TAB, row, header_if_empty=EVENTS_HEADER)
+    st.session_state["cache_buster"] += 1
 
 
-def _get_sa_info():
-    if "gcp_service_account" not in st.secrets:
-        st.error("Falta [gcp_service_account] no secrets.toml.")
-        st.stop()
-    return dict(st.secrets["gcp_service_account"])
+def authenticate(users_df: pd.DataFrame) -> Optional[Dict[str, str]]:
+    st.session_state.setdefault("logged_in", False)
+    st.session_state.setdefault("user_login", "")
+    st.session_state.setdefault("user_nome", "")
 
+    if st.session_state["logged_in"]:
+        return {"login": st.session_state["user_login"], "nome": st.session_state["user_nome"]}
 
-# =========================
-# Google Sheets client
-# =========================
+    st.title("Login")
+    st.caption("Acesso protegido por usuario e senha.")
 
-@st.cache_resource
-def get_gspread_client():
-    info = _get_sa_info()
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+    u = st.text_input("Usuario", key="u")
+    p = st.text_input("Senha", type="password", key="p")
 
+    if st.button("Entrar", type="primary"):
+        u2 = str(u).strip()
+        p2 = str(p).strip()
+        hit = users_df[(users_df["login"] == u2) & (users_df["senha"] == p2)]
+        if hit.empty:
+            st.error("Usuario ou senha invalidos.")
+            return None
 
-def _open_sheet(spreadsheet_id: str):
-    gc = get_gspread_client()
-    return gc.open_by_key(spreadsheet_id)
+        nome = u2
+        if "nome" in hit.columns:
+            nome = str(hit.iloc[0]["nome"]).strip() or u2
 
+        st.session_state["logged_in"] = True
+        st.session_state["user_login"] = u2
+        st.session_state["user_nome"] = nome
+        st.rerun()
 
-def _pick_worksheet(sh, candidates: list[str]):
-    titles = [w.title for w in sh.worksheets()]
-    title_set = set(titles)
-    for c in candidates:
-        if c in title_set:
-            return sh.worksheet(c)
-    # tenta match case-insensitive
-    low_map = {t.lower(): t for t in titles}
-    for c in candidates:
-        if c.lower() in low_map:
-            return sh.worksheet(low_map[c.lower()])
     return None
 
 
-@st.cache_data(ttl=25, show_spinner=False)
-def read_worksheet_df(spreadsheet_id: str, worksheet_title: str, cache_buster: int) -> pd.DataFrame:
-    sh = _open_sheet(spreadsheet_id)
-    ws = sh.worksheet(worksheet_title)
-    values = ws.get_all_values()
-    if not values or len(values) < 1:
-        return pd.DataFrame()
-    header = values[0]
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=header)
-    # normaliza colunas vazias
-    df.columns = [ _norm(c) for c in df.columns ]
-    return df
-
-
-def append_log_row(logs_sheet_id: str, ws_title: str, row: list):
-    sh = _open_sheet(logs_sheet_id)
-    ws = sh.worksheet(ws_title)
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-
-# =========================
-# Modelos e carregamento
-# =========================
-
-@dataclass
-class Tables:
-    areas: pd.DataFrame
-    itens: pd.DataFrame
-    usuarios: pd.DataFrame
-    logs: pd.DataFrame
-    ws_logs_title: str
-    ws_areas_title: str
-    ws_itens_title: str
-    ws_usuarios_title: str
-
-
-def load_tables(config_sheet_id: str, rules_sheet_id: str, logs_sheet_id: str, cache_buster: int) -> Tables:
-    sh_cfg = _open_sheet(config_sheet_id)
-    ws_areas = _pick_worksheet(sh_cfg, WS_AREAS_CANDIDATES)
-    ws_itens = _pick_worksheet(sh_cfg, WS_ITENS_CANDIDATES)
-    if not ws_areas or not ws_itens:
-        st.error("Checklist_Config precisa ter as abas AREAS e ITENS (ou nomes compatíveis).")
-        st.stop()
-
-    sh_rules = _open_sheet(rules_sheet_id)
-    ws_users = _pick_worksheet(sh_rules, WS_USUARIOS_CANDIDATES)
-    if not ws_users:
-        st.error("App_Regras precisa ter a aba USUARIOS (ou nome compatível).")
-        st.stop()
-
-    sh_logs = _open_sheet(logs_sheet_id)
-    ws_logs = _pick_worksheet(sh_logs, WS_LOGS_CANDIDATES)
-    if not ws_logs:
-        st.error("Checklist_Logs precisa ter a aba LOGS (ou nome compatível).")
-        st.stop()
-
-    df_areas = read_worksheet_df(config_sheet_id, ws_areas.title, cache_buster)
-    df_itens = read_worksheet_df(config_sheet_id, ws_itens.title, cache_buster)
-    df_users = read_worksheet_df(rules_sheet_id, ws_users.title, cache_buster)
-    df_logs = read_worksheet_df(logs_sheet_id, ws_logs.title, cache_buster)
-
-    return Tables(
-        areas=df_areas,
-        itens=df_itens,
-        usuarios=df_users,
-        logs=df_logs,
-        ws_logs_title=ws_logs.title,
-        ws_areas_title=ws_areas.title,
-        ws_itens_title=ws_itens.title,
-        ws_usuarios_title=ws_users.title,
-    )
-
-
-# =========================
-# Validações mínimas
-# =========================
-
-def validate_users(df: pd.DataFrame):
-    c_login = _col(df, "login", "user", "usuario", "usuário")
-    c_senha = _col(df, "senha", "password")
-    c_ativo = _col(df, "ativo", "active")
-    c_nome = _col(df, "nome", "name")
-    if not c_login or not c_senha:
-        st.error("A aba USUARIOS precisa ter colunas login e senha.")
-        st.stop()
-    return c_login, c_senha, c_ativo, c_nome
-
-
-def validate_areas(df: pd.DataFrame):
-    c_id = _col(df, "area_id", "id_area")
-    c_nome = _col(df, "area_nome", "nome_area", "area")
-    c_ativo = _col(df, "ativo", "active")
-    c_ordem = _col(df, "ordem", "order")
-    if not c_id or not c_nome:
-        st.error("A aba AREAS precisa ter colunas area_id e area_nome.")
-        st.stop()
-    return c_id, c_nome, c_ativo, c_ordem
-
-
-def validate_itens(df: pd.DataFrame):
-    c_item_id = _col(df, "item_id", "id_item")
-    c_texto = _col(df, "item_texto", "texto", "descricao", "descrição")
-    c_area = _col(df, "area_id", "id_area")
-    c_turno = _col(df, "turno", "shift")
-    c_ordem = _col(df, "ordem", "order")
-    if not c_item_id or not c_texto or not c_area or not c_turno:
-        st.error("A aba ITENS precisa ter: item_id, item_texto (ou texto), area_id e turno.")
-        st.stop()
-
-    c_tipo = _col(df, "tipo_resposta", "tipo", "resposta")
-    c_deadline = _col(df, "deadline_hhmm", "deadline", "prazo", "hora_deadline")
-    c_critico = _col(df, "critico", "crítico", "critical")
-    c_min = _col(df, "min", "minimo", "mínimo")
-    return c_item_id, c_texto, c_area, c_turno, c_ordem, c_tipo, c_deadline, c_critico, c_min
-
-
-# =========================
-# Auth
-# =========================
-
-def authenticate(tables: Tables):
-    df = tables.usuarios.copy()
-    c_login, c_senha, c_ativo, c_nome = validate_users(df)
-
-    st.subheader("Login")
-    st.caption("Acesso protegido por usuário e senha.")
-
-    user = st.text_input("Usuário", key="login_user")
-    pwd = st.text_input("Senha", type="password", key="login_pwd")
-    ok = st.button("Entrar", type="primary")
-
-    if not ok:
-        return None
-
-    df[c_login] = df[c_login].astype(str).str.strip()
-    df[c_senha] = df[c_senha].astype(str).str.strip()
-
-    row = df[df[c_login].str.lower() == _norm(user).lower()]
-    if row.empty:
-        st.error("Usuário não encontrado.")
-        return None
-
-    row = row.iloc[0]
-    if c_ativo and not _parse_bool(row[c_ativo]):
-        st.error("Usuário inativo.")
-        return None
-
-    if _norm(pwd) != _norm(row[c_senha]):
-        st.error("Senha incorreta.")
-        return None
-
-    return {
-        "login": _norm(row[c_login]),
-        "nome": _norm(row[c_nome]) if c_nome else _norm(row[c_login]),
-    }
-
-
-# =========================
-# Status por item no dia selecionado
-# =========================
-
-def build_status_map(itens_df: pd.DataFrame, logs_df: pd.DataFrame, selected_date: date):
-    # colunas logs
-    if logs_df is None or logs_df.empty:
-        return {}
-
-    c_data = _col(logs_df, "data", "date")
-    c_item = _col(logs_df, "item_id", "id_item")
-    c_status = _col(logs_df, "status")
-    c_hora = _col(logs_df, "hora", "time")
-    if not c_data or not c_item or not c_status:
-        return {}
-
-    # filtra dia
-    day_str = selected_date.isoformat()
-    d = logs_df.copy()
-    d[c_data] = d[c_data].astype(str).str.strip()
-    d = d[d[c_data] == day_str]
-    if d.empty:
-        return {}
-
-    # ordena por hora, se existir
-    if c_hora and c_hora in d.columns:
-        d["_hora_sort"] = d[c_hora].astype(str)
-        d = d.sort_values("_hora_sort")
-    else:
-        d = d.reset_index()
-
-    status_map = {}
-    for _, r in d.iterrows():
-        item_id = _norm(r[c_item])
-        status = _norm(r[c_status]).upper()
-        if status in ["NÃO_OK", "NAO OK", "NAO_OK"]:
-            status = STATUS_NAO_OK
-        if status in ["OK"]:
-            status = STATUS_OK
-        if status in ["PENDENTE", ""]:
-            status = STATUS_PENDENTE
-        status_map[item_id] = status
-
-    return status_map
-
-
-# =========================
-# UI: estilos
-# =========================
-
-def inject_css():
-    st.markdown("""
-    <style>
-    /* botões neutros (OK e Não OK iguais visualmente) */
-    div.stButton > button {
-      background: white !important;
-      color: #111 !important;
-      border: 1px solid #d0d0d0 !important;
-      border-radius: 10px !important;
-      font-weight: 700 !important;
-      padding: 0.5rem 1.1rem !important;
-    }
-    div.stButton > button:hover { border-color: #9a9a9a !important; }
-    div.stButton > button:disabled {
-      opacity: 0.55 !important;
-      border-color: #333 !important;
-      box-shadow: inset 0 0 0 2px #333 !important;
-    }
-
-    /* cards */
-    .card {
-      border-radius: 14px;
-      padding: 14px 16px;
-      margin: 10px 0 10px 0;
-      border: 1px solid rgba(0,0,0,0.06);
-    }
-    .card h4 { margin: 0 0 6px 0; font-size: 16px; }
-    .meta { opacity: 0.85; font-size: 13px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-def card_html(title: str, status_label: str, deadline: str, bg: str):
-    dl = _norm(deadline)
-    dl_txt = f" | Deadline: {dl}" if dl else ""
-    return f"""
-    <div class="card" style="background:{bg};">
-      <h4>{title}</h4>
-      <div class="meta">Status: <b>{status_label}</b>{dl_txt}</div>
-    </div>
-    """
-
-
-# =========================
-# Gravação de log
-# =========================
-
-def write_log(tables: Tables, selected_date: date, user: dict, area_id: str, turno: str, item_id: str, texto: str, status: str, obs: str):
-    # prepara colunas conforme padrão atual
-    day_str = selected_date.isoformat()
-    hr = now_dt().strftime("%H:%M:%S")
-    dia_semana = weekday_pt_br(selected_date)
-
-    row = [
-        day_str,               # data
-        hr,                    # hora
-        dia_semana,            # dia_semana
-        user.get("login",""),  # user_login
-        user.get("nome",""),   # user_nome
-        area_id,               # area_id
-        turno,                 # turno
-        item_id,               # item_id
-        texto,                 # texto
-        status,                # status
-        obs or "",             # obs
-    ]
-    append_log_row(tables.logs_sheet_id, tables.ws_logs_title, row)  # type: ignore
-
-
-# =========================
-# Páginas
-# =========================
-
-def page_dashboard(tables: Tables, selected_date: date):
-    st.header("Dashboard operacional")
-
-    areas = tables.areas.copy()
-    itens = tables.itens.copy()
-    logs = tables.logs.copy()
-
-    c_area_id, c_area_nome, c_area_ativo, c_area_ordem = validate_areas(areas)
-    c_item_id, c_texto, c_area, c_turno, c_ordem, c_tipo, c_deadline, c_critico, c_min = validate_itens(itens)
-
-    # filtra áreas ativas
-    if c_area_ativo:
-        areas["_ativo"] = areas[c_area_ativo].apply(_parse_bool)
-        areas = areas[areas["_ativo"] == True].copy()
-
-    # status map por item no dia
-    status_map = build_status_map(itens, logs, selected_date)
-
-    # monta base itens
-    base = itens.copy()
-    base["item_id"] = base[c_item_id].astype(str).map(_norm)
-    base["texto"] = base[c_texto].astype(str).map(_norm)
-    base["area_id"] = base[c_area].astype(str).map(_norm)
-    base["turno"] = base[c_turno].astype(str).map(_norm)
-
-    if c_deadline:
-        base["deadline_hhmm"] = base[c_deadline].astype(str).map(_norm)
-    else:
-        base["deadline_hhmm"] = ""
-
-    if c_ordem:
-        base["_ordem"] = pd.to_numeric(base[c_ordem], errors="coerce").fillna(9999).astype(int)
-    else:
-        base["_ordem"] = 9999
-
-    base["status"] = base["item_id"].map(lambda x: status_map.get(x, STATUS_PENDENTE))
-
-    base["atrasado"] = base.apply(lambda r: is_overdue(selected_date, r["deadline_hhmm"], r["status"]), axis=1)
-
-    # agregações
-    total = len(base)
-    n_ok = int((base["status"] == STATUS_OK).sum())
-    n_no = int((base["status"] == STATUS_NAO_OK).sum())
-    n_pendente = int((base["status"] == STATUS_PENDENTE).sum())
-    n_atrasado = int((base["atrasado"] == True).sum())
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("OK", n_ok)
-    c2.metric("Não OK", n_no)
-    c3.metric("Pendentes", n_pendente)
-    c4.metric("Atrasados", n_atrasado)
-
-    st.divider()
-
-    # detalhe por área e turno
-    st.subheader("Resumo por área e turno")
-    grp = base.groupby(["area_id", "turno"], as_index=False).agg(
-        total=("item_id", "count"),
-        ok=("status", lambda s: int((s == STATUS_OK).sum())),
-        nao_ok=("status", lambda s: int((s == STATUS_NAO_OK).sum())),
-        pendente=("status", lambda s: int((s == STATUS_PENDENTE).sum())),
-        atrasado=("atrasado", lambda s: int((s == True).sum())),
-    )
-    if grp.empty:
-        st.info("Sem itens configurados.")
+def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
+    st.subheader("Dashboard operacional")
+
+    areas = cfg["areas"]
+    itens = cfg["itens"]
+
+    today_d = datetime.now(TZ).date()
+    st.session_state.setdefault("dash_date", today_d)
+
+    colA, colB, colC = st.columns([1.2, 1, 1])
+    with colA:
+        dash_date = st.date_input("Data do dashboard", value=st.session_state["dash_date"])
+        st.session_state["dash_date"] = dash_date
+    with colB:
+        if st.button("Hoje"):
+            st.session_state["dash_date"] = today_d
+            st.session_state["cache_buster"] += 1
+            st.rerun()
+    with colC:
+        if st.button("Atualizar agora"):
+            st.session_state["cache_buster"] += 1
+            st.rerun()
+
+    day_iso = st.session_state["dash_date"].isoformat()
+    mp = latest_status_map_for_day(events_df, day_iso)
+
+    turnos = sorted(itens["turno"].dropna().astype(str).str.strip().unique().tolist())
+
+    for _, a in areas.iterrows():
+        area_id = str(a["area_id"]).strip()
+        area_nome = str(a["area_nome"]).strip()
+        st.markdown(f"### {area_nome}")
+
+        cols = st.columns(2 if len(turnos) >= 2 else 1)
+        for i, turno in enumerate(turnos):
+            df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno)].copy()
+            total = len(df_items)
+
+            ok = 0
+            nok = 0
+            atraso = 0
+
+            for _, it in df_items.iterrows():
+                item_id = str(it["item_id"]).strip()
+                key = (area_id, turno, item_id)
+                raw_status = mp.get(key, "PENDENTE")
+                deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
+                eff = compute_item_effective_status_for_day(day_iso, raw_status, deadline)
+                if eff == "OK":
+                    ok += 1
+                elif eff == "NAO_OK":
+                    nok += 1
+                elif eff == "ATRASADO":
+                    atraso += 1
+
+            pct = int(round((ok / total) * 100, 0)) if total else 0
+
+            bg = "#0b6a5a" if (total > 0 and ok == total) else "#1f2937"
+            if atraso > 0:
+                bg = "#b45309"
+            elif nok > 0:
+                bg = "#7a1f2b"
+            elif ok > 0 and ok < total:
+                bg = "#8b6b12"
+
+            with cols[i % len(cols)]:
+                st.markdown(
+                    f"""
+                    <div style="border-radius:16px;padding:14px;margin:8px 0;background:{bg};color:white;">
+                      <div style="font-size:16px;font-weight:800;">{turno}</div>
+                      <div style="font-size:13px;opacity:0.95;margin-top:6px;">
+                        OK {ok}/{total} | Nao OK {nok} | Atrasado {atraso}
+                      </div>
+                      <div style="font-size:22px;font-weight:900;margin-top:10px;">{pct}%</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+
+def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: Dict[str, str]):
+    st.subheader("Checklist")
+
+    areas = cfg["areas"]
+    itens = cfg["itens"]
+
+    today_iso = datetime.now(TZ).date().isoformat()
+    mp = latest_status_map_for_day(events_df, today_iso)
+
+    areas_labels = [f"{r['area_nome']} ({r['area_id']})" for _, r in areas.iterrows()]
+    area_sel = st.selectbox("Area", areas_labels, index=0)
+    area_id = area_sel.split("(")[-1].replace(")", "").strip()
+
+    turnos = sorted(itens[itens["area_id"] == area_id]["turno"].dropna().astype(str).str.strip().unique().tolist())
+    if not turnos:
+        st.warning("Sem turnos para esta area na ITENS.")
         return
 
-    st.dataframe(grp, use_container_width=True)
-
-
-def page_checklist(tables: Tables, user: dict, selected_date: date):
-    st.header("Checklist")
-
-    areas = tables.areas.copy()
-    itens = tables.itens.copy()
-    logs = tables.logs.copy()
-
-    c_area_id, c_area_nome, c_area_ativo, c_area_ordem = validate_areas(areas)
-    c_item_id, c_texto, c_area, c_turno, c_ordem, c_tipo, c_deadline, c_critico, c_min = validate_itens(itens)
-
-    # areas ativas e ordenadas
-    if c_area_ativo:
-        areas["_ativo"] = areas[c_area_ativo].apply(_parse_bool)
-        areas = areas[areas["_ativo"] == True].copy()
-
-    if c_area_ordem:
-        areas["_ord"] = pd.to_numeric(areas[c_area_ordem], errors="coerce").fillna(9999).astype(int)
-        areas = areas.sort_values("_ord")
-    else:
-        areas["_ord"] = 9999
-
-    # turnos disponíveis a partir dos itens
-    itens["turno_norm"] = itens[c_turno].astype(str).map(_norm)
-    turnos = sorted([t for t in itens["turno_norm"].unique().tolist() if t])
-
-    # ui seleção
-    st.caption("Tudo começa PENDENTE. Clique OK, Não OK ou Desmarcar. Para itens NUMERO/TEXTO, preencha o campo antes de registrar.")
-    colA, colB = st.columns(2)
-    with colA:
-        area_opts = [(r[c_area_id], r[c_area_nome]) for _, r in areas.iterrows()]
-        area_labels = [f"{aid} - {an}" for aid, an in area_opts]
-        area_sel = st.selectbox("Área", options=list(range(len(area_opts))), format_func=lambda i: area_labels[i])
-        area_id = area_opts[area_sel][0]
-    with colB:
-        turno = st.selectbox("Turno", options=turnos if turnos else ["(sem turnos)"])
+    turno_sel = st.selectbox("Turno", turnos, index=0)
 
     if st.button("Atualizar lista"):
         st.session_state["cache_buster"] += 1
         st.rerun()
 
-    # filtra itens por area e turno
-    base = itens.copy()
-    base["_area_id"] = base[c_area].astype(str).map(_norm)
-    base["_turno"] = base[c_turno].astype(str).map(_norm)
-
-    base = base[(base["_area_id"] == area_id) & (base["_turno"] == turno)].copy()
-    if base.empty:
-        st.info("Sem itens para esta área e turno.")
+    df_items = itens[(itens["area_id"] == area_id) & (itens["turno"] == turno_sel)].copy()
+    if df_items.empty:
+        st.warning("Sem itens para esta combinacao.")
         return
 
-    # ordenação
-    if c_ordem:
-        base["_ordem"] = pd.to_numeric(base[c_ordem], errors="coerce").fillna(9999).astype(int)
-    else:
-        base["_ordem"] = 9999
-    base = base.sort_values("_ordem")
+    st.caption("Tudo comeca PENDENTE. Clique OK, Nao OK ou Desmarcar. Para itens NUMERO/TEXTO, preencha o campo e clique OK (ou Nao OK).")
 
-    # status do dia
-    status_map = build_status_map(itens, logs, selected_date)
+    for _, it in df_items.iterrows():
+        item_id = str(it["item_id"]).strip()
+        texto = str(it["texto"]).strip()
+        key = (area_id, turno_sel, item_id)
+        raw_status = mp.get(key, "PENDENTE").upper()
 
-    # render itens
-    for _, r in base.iterrows():
-        item_id = _norm(r[c_item_id])
-        texto = _norm(r[c_texto])
-        tipo = _norm(r[c_tipo]).upper() if c_tipo else "OK, NAO OK"
-        deadline = _norm(r[c_deadline]) if c_deadline else ""
+        deadline = str(it["deadline_hhmm"]).strip() if "deadline_hhmm" in df_items.columns else ""
+        eff = compute_item_effective_status_for_day(today_iso, raw_status, deadline)
+        bg, label = card_palette(eff)
 
-        status_atual = status_map.get(item_id, STATUS_PENDENTE)
+        tipo_resposta = _norm_tipo_resposta(it.get("tipo_resposta", ""))
+        min_hint = _safe_float(it.get("min", ""))
 
-        # atraso
-        overdue = is_overdue(selected_date, deadline, status_atual)
+        deadline_line = ""
+        if deadline:
+            deadline_line = f"<div style='font-size:12px;margin-top:4px;opacity:0.85;'><b>Deadline:</b> {deadline}</div>"
 
-        # cores do card
-        if overdue:
-            bg = "rgba(255, 214, 102, 0.30)"  # amarelo suave
-            status_label = "ATRASADO"
-        elif status_atual == STATUS_OK:
-            bg = "rgba(46, 204, 113, 0.18)"   # verde suave
-            status_label = "OK"
-        elif status_atual == STATUS_NAO_OK:
-            bg = "rgba(231, 76, 60, 0.16)"    # vermelho suave
-            status_label = "Não OK"
-        else:
-            bg = "rgba(0, 0, 0, 0.04)"        # cinza suave
-            status_label = "PENDENTE"
+        tipo_line = ""
+        if tipo_resposta in ["NUMERO", "TEXTO"]:
+            tipo_line = f"<div style='font-size:12px;margin-top:4px;opacity:0.85;'><b>Entrada:</b> {tipo_resposta}</div>"
 
-        st.markdown(card_html(texto, status_label, deadline, bg), unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div style="border-radius:14px;padding:12px;background:{bg};margin:10px 0;">
+              <div style="font-size:15px;font-weight:900;">{texto}</div>
+              <div style="font-size:12px;margin-top:6px;"><b>Status:</b> {label}</div>
+              {deadline_line}
+              {tipo_line}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        # campo de obs para NUMERO/TEXTO
-        obs_val = ""
-        needs_obs = (tipo in ["NUMERO", "TEXTO"])
+        # Labels com marca (fica claro o status atual sem mexer em cor de botão)
+        ok_label = "OK" + (" ✓" if eff == "OK" else "")
+        nok_label = "Nao OK" + (" ✗" if eff == "NAO_OK" else "")
+        rst_label = "Desmarcar"
 
-        if needs_obs:
-            if tipo == "NUMERO":
-                obs_val = st.text_input("Valor (número)", key=f"obs_{item_id}", placeholder="Ex: 3,5 ou 10")
-            else:
-                obs_val = st.text_input("Observação", key=f"obs_{item_id}", placeholder="Digite o texto")
+        obs_value: str = ""
+        obs_key = f"obs_{area_id}_{turno_sel}_{item_id}"
 
-        # botões com realce via disabled
-        b1, b2, b3 = st.columns([1, 1, 1])
+        # Campo extra apenas quando NUMERO/TEXTO
+        if tipo_resposta == "NUMERO":
+            st.session_state.setdefault(obs_key, "")
+            default_num = _safe_float(st.session_state.get(obs_key, ""))
+            if default_num is None:
+                default_num = min_hint if min_hint is not None else 0.0
 
-        is_ok = (status_atual == STATUS_OK)
-        is_no = (status_atual == STATUS_NAO_OK)
-        is_pendente = (status_atual == STATUS_PENDENTE)
+            # Permitindo negativos (ex: freezer)
+            min_value = min_hint if min_hint is not None else None
 
-        with b1:
-            if st.button("OK", key=f"ok_{item_id}", disabled=is_ok):
-                if needs_obs and not _norm(obs_val):
-                    st.warning("Preencha o valor antes de registrar.")
+            val = st.number_input(
+                "Valor (numero)",
+                value=float(default_num),
+                min_value=min_value,
+                key=f"in_{obs_key}",
+                step=0.5,
+            )
+            obs_value = str(val)
+            st.session_state[obs_key] = obs_value
+
+        elif tipo_resposta == "TEXTO":
+            st.session_state.setdefault(obs_key, "")
+            val = st.text_input(
+                "Observacao (texto)",
+                value=str(st.session_state.get(obs_key, "")),
+                key=f"in_{obs_key}",
+                placeholder="Digite aqui...",
+            )
+            obs_value = str(val).strip()
+            st.session_state[obs_key] = obs_value
+
+        c1, c2, c3 = st.columns([1, 1, 1])
+
+        # Importante: nao usar type="primary" para o OK (evita parecer marcado por cor)
+        with c1:
+            if st.button(ok_label, key=f"ok_{area_id}_{turno_sel}_{item_id}", type="secondary"):
+                if tipo_resposta in ["NUMERO", "TEXTO"] and not str(obs_value).strip():
+                    st.warning("Preencha o campo antes de marcar OK.")
                 else:
-                    _append_log(tables, selected_date, user, area_id, turno, item_id, texto, STATUS_OK, obs_val if needs_obs else "")
-                    st.session_state["cache_buster"] += 1
+                    write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "OK", obs=str(obs_value).strip())
                     st.rerun()
 
-        with b2:
-            if st.button("Não OK", key=f"no_{item_id}", disabled=is_no):
-                if needs_obs and not _norm(obs_val):
-                    st.warning("Preencha o valor antes de registrar.")
-                else:
-                    _append_log(tables, selected_date, user, area_id, turno, item_id, texto, STATUS_NAO_OK, obs_val if needs_obs else "")
-                    st.session_state["cache_buster"] += 1
-                    st.rerun()
+        with c2:
+            if st.button(nok_label, key=f"nok_{area_id}_{turno_sel}_{item_id}", type="secondary"):
+                # Se houver valor preenchido, grava junto no obs (mesmo em NAO_OK)
+                write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "NAO_OK", obs=str(obs_value).strip())
+                st.rerun()
 
-        with b3:
-            if st.button("Desmarcar", key=f"un_{item_id}", disabled=is_pendente):
-                _append_log(tables, selected_date, user, area_id, turno, item_id, texto, STATUS_PENDENTE, "")
-                st.session_state["cache_buster"] += 1
+        with c3:
+            if st.button(rst_label, key=f"rst_{area_id}_{turno_sel}_{item_id}", type="secondary"):
+                # Desmarcar volta a pendente e limpa obs
+                write_event(user["login"], user["nome"], area_id, turno_sel, item_id, texto, "PENDENTE", obs="")
+                st.session_state[obs_key] = ""
                 st.rerun()
 
 
-def _append_log(tables: Tables, selected_date: date, user: dict, area_id: str, turno: str, item_id: str, texto: str, status: str, obs: str):
-    # Escreve linha no LOGS com o layout padrão.
-    logs_sheet_id = st.session_state["LOGS_SHEET_ID"]
-    ws_title = tables.ws_logs_title
+def page_events(events_df: pd.DataFrame):
+    st.subheader("EVENTS")
+    if st.button("Atualizar EVENTS"):
+        st.session_state["cache_buster"] += 1
+        st.rerun()
+    st.dataframe(events_df, use_container_width=True, height=560)
 
-    day_str = selected_date.isoformat()
-    hr = now_dt().strftime("%H:%M:%S")
-    dia_semana = weekday_pt_br(selected_date)
-
-    row = [
-        day_str,                 # data
-        hr,                      # hora
-        dia_semana,              # dia_semana
-        user.get("login", ""),   # user_login
-        user.get("nome", ""),    # user_nome
-        area_id,                 # area_id
-        turno,                   # turno
-        item_id,                 # item_id
-        texto,                   # texto
-        status,                  # status
-        obs or "",               # obs
-    ]
-    append_log_row(logs_sheet_id, ws_title, row)
-
-
-# =========================
-# Main
-# =========================
 
 def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    inject_css()
+    st.set_page_config(page_title="Checklist Operacional", layout="wide")
 
-    if "cache_buster" not in st.session_state:
-        st.session_state["cache_buster"] = 1
+    st.session_state.setdefault("cache_buster", 1)
+    require_ids()
 
-    config_sheet_id, rules_sheet_id, logs_sheet_id = _get_sheet_ids()
-    st.session_state["CONFIG_SHEET_ID"] = config_sheet_id
-    st.session_state["RULES_SHEET_ID"] = rules_sheet_id
-    st.session_state["LOGS_SHEET_ID"] = logs_sheet_id
+    with st.sidebar:
+        st.markdown("## Checklist Operacional")
 
-    # Sidebar
-    st.sidebar.title(APP_TITLE)
-    st.sidebar.caption("Status")
-    st.sidebar.success("Google Sheets conectado")
-
-    # Data (default hoje)
-    st.sidebar.caption("Filtro de data (Dashboard e Checklist)")
-    selected_date = st.sidebar.date_input("Data", value=date.today())
-
-    # Carrega tabelas (cacheado)
-    try:
-        tables = load_tables(config_sheet_id, rules_sheet_id, logs_sheet_id, st.session_state["cache_buster"])
-        # injeta ids no objeto para usar no writer sem alterar estrutura
-        tables.config_sheet_id = config_sheet_id  # type: ignore
-        tables.rules_sheet_id = rules_sheet_id    # type: ignore
-        tables.logs_sheet_id = logs_sheet_id      # type: ignore
-    except gspread.exceptions.APIError as e:
-        # evita ciclo de erro
-        st.error("Erro ao acessar Google Sheets. Verifique permissões e IDs das planilhas.")
-        st.code(str(e))
-        return
-
-    # Login / sessão
-    if "user" not in st.session_state:
-        st.session_state["user"] = None
-
-    # Navegação
-    page = st.sidebar.radio("Navegação", ["Dashboard", "Checklist"])
-
-    if st.session_state["user"] is None:
-        user = authenticate(tables)
-        if user:
-            st.session_state["user"] = user
+        if st.button("Logout"):
+            for k in list(st.session_state.keys()):
+                if k not in ["cache_buster", "dash_date"]:
+                    st.session_state.pop(k, None)
+            st.session_state["cache_buster"] += 1
             st.rerun()
+
+        st.markdown("### Status")
+        try:
+            _ = gs_client()
+            st.success("Google Sheets conectado")
+        except Exception as e:
+            st.error(f"Falha ao conectar: {e}")
+
+        st.markdown("### Navegacao")
+        st.session_state.setdefault("nav", "Dashboard")
+        st.radio("Ir para", ["Dashboard", "Checklist", "EVENTS"], key="nav", label_visibility="collapsed")
+
+    cfg = load_config_tables(st.session_state["cache_buster"])
+    users_df = load_users_table(st.session_state["cache_buster"])
+    events_df = load_events_last(st.session_state["cache_buster"], last_rows=2000)
+
+    user = authenticate(users_df)
+    if not user:
         return
 
-    st.sidebar.button("Logout", on_click=lambda: st.session_state.update({"user": None}))
-
-    if page == "Dashboard":
-        page_dashboard(tables, selected_date)
+    nav = st.session_state.get("nav", "Dashboard")
+    if nav == "Checklist":
+        page_checklist(cfg, events_df, user)
+    elif nav == "EVENTS":
+        page_events(events_df)
     else:
-        page_checklist(tables, st.session_state["user"], selected_date)
+        page_dashboard(cfg, events_df)
 
 
 if __name__ == "__main__":
