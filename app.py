@@ -80,8 +80,17 @@ def retryable(fn, tries=6, base_sleep=0.8, max_sleep=10.0):
         except APIError as e:
             last = e
             msg = str(e)
-            is_quota = ("429" in msg) or ("Quota exceeded" in msg) or ("RESOURCE_EXHAUSTED" in msg)
-            if (not is_quota) and i >= 1:
+            is_retry = (
+                ("429" in msg)
+                or ("Quota exceeded" in msg)
+                or ("RESOURCE_EXHAUSTED" in msg)
+                or ("503" in msg)
+                or ("500" in msg)
+                or ("502" in msg)
+                or ("504" in msg)
+                or ("internal error" in msg.lower())
+            )
+            if (not is_retry) and i >= 1:
                 raise
             time.sleep(min(max_sleep, base_sleep * (2 ** i)))
     raise last
@@ -103,7 +112,12 @@ def open_sheet(sheet_id: str):
 
 def list_tabs(sheet_id: str) -> List[str]:
     sh = open_sheet(sheet_id)
-    return [ws.title for ws in sh.worksheets()]
+    worksheets = retryable(lambda: sh.worksheets())
+    return [ws.title for ws in worksheets]
+
+
+def get_worksheet(sh, tab: str):
+    return retryable(lambda: sh.worksheet(tab))
 
 
 def pick_tab(sheet_id: str, candidates: List[str]) -> str:
@@ -124,16 +138,16 @@ def get_or_create_tab(sheet_id: str, title: str, rows=5000, cols=30):
 
     def _do():
         try:
-            return sh.worksheet(title)
+            return get_worksheet(sh, title)
         except Exception:
-            return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+            return retryable(lambda: sh.add_worksheet(title=title, rows=str(rows), cols=str(cols)))
 
     return retryable(_do)
 
 
 def read_all_values(sheet_id: str, tab: str) -> List[List[str]]:
     sh = open_sheet(sheet_id)
-    ws = sh.worksheet(tab)
+    ws = get_worksheet(sh, tab)
     return retryable(lambda: ws.get_all_values())
 
 
@@ -145,7 +159,7 @@ def write_header_if_empty(ws, header: List[str]):
 
 def append_row(sheet_id: str, tab: str, row: List[str], header_if_empty: Optional[List[str]] = None):
     sh = open_sheet(sheet_id)
-    ws = sh.worksheet(tab)
+    ws = get_worksheet(sh, tab)
     if header_if_empty:
         write_header_if_empty(ws, header_if_empty)
     retryable(lambda: ws.append_row(row, value_input_option="RAW"))
