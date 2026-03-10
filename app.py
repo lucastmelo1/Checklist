@@ -81,7 +81,10 @@ def retryable(fn, tries=3, base_sleep=0.3, max_sleep=1.5):
         except APIError as e:
             last = e
             msg = str(e)
-            is_retry = any(x in msg for x in ["429", "500", "502", "503", "504", "RESOURCE_EXHAUSTED", "Quota exceeded"])
+            is_retry = any(
+                x in msg
+                for x in ["429", "500", "502", "503", "504", "RESOURCE_EXHAUSTED", "Quota exceeded"]
+            )
             if (not is_retry) and i >= 1:
                 raise
             time.sleep(min(max_sleep, base_sleep * (2 ** i)))
@@ -103,9 +106,13 @@ def open_sheet(sheet_id: str):
 
 
 @st.cache_data(ttl=3600)
-def resolve_tab_name(sheet_id: str, candidates: Tuple[str, ...]) -> str:
+def list_tabs_cached(sheet_id: str) -> List[str]:
     sh = open_sheet(sheet_id)
-    titles = [ws.title for ws in retryable(lambda: sh.worksheets())]
+    return [ws.title for ws in retryable(lambda: sh.worksheets())]
+
+
+def resolve_tab_name(sheet_id: str, candidates: Tuple[str, ...]) -> str:
+    titles = list_tabs_cached(sheet_id)
     s = set(titles)
 
     for c in candidates:
@@ -123,6 +130,28 @@ def resolve_tab_name(sheet_id: str, candidates: Tuple[str, ...]) -> str:
 def get_ws(sheet_id: str, tab: str):
     sh = open_sheet(sheet_id)
     return retryable(lambda: sh.worksheet(tab))
+
+
+def get_or_create_tab(sheet_id: str, title: str, rows=5000, cols=30):
+    sh = open_sheet(sheet_id)
+
+    def _do():
+        try:
+            return sh.worksheet(title)
+        except Exception:
+            ws = sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+            list_tabs_cached.clear()
+            return ws
+
+    return retryable(_do)
+
+
+def ensure_events_tab():
+    ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=20000, cols=30)
+    first = retryable(lambda: ws.row_values(1))
+    if (not first) or all(str(x).strip() == "" for x in first):
+        retryable(lambda: ws.append_row(EVENTS_HEADER, value_input_option="RAW"))
+    return ws
 
 
 def strip_accents(text: str) -> str:
@@ -335,6 +364,7 @@ def load_config_tables() -> Dict[str, pd.DataFrame]:
 
         if "dia_semana" not in itens.columns:
             itens["dia_semana"] = ""
+
         itens["dia_semana"] = itens["dia_semana"].astype(str).map(normalize_weekday_name)
 
         if "ativo" in itens.columns:
@@ -352,38 +382,20 @@ def load_config_tables() -> Dict[str, pd.DataFrame]:
     return {"areas": areas, "itens": itens}
 
 
-def ensure_events_tab():
-    ws = get_or_create_tab(LOGS_SHEET_ID, EVENTS_TAB, rows=20000, cols=30)
-    first = retryable(lambda: ws.row_values(1))
-    if (not first) or all(str(x).strip() == "" for x in first):
-        retryable(lambda: ws.append_row(EVENTS_HEADER, value_input_option="RAW"))
-    return ws
-
-
 @st.cache_data(ttl=12)
 def load_events_last(last_rows: int = 500) -> pd.DataFrame:
     require_ids()
     ws = ensure_events_tab()
-    values = retryable(lambda: ws.get(f"A1:L{last_rows + 50}"))
+    all_values = retryable(lambda: ws.get_all_values())
 
-    if not values:
+    if not all_values:
         return pd.DataFrame(columns=norm_cols(EVENTS_HEADER))
 
-    # fallback seguro se a planilha tiver mais linhas, mas o range pegou poucas
-    if len(values) <= 1:
-        all_values = retryable(lambda: ws.get_all_values())
-        if not all_values:
-            return pd.DataFrame(columns=norm_cols(EVENTS_HEADER))
-        header = all_values[0]
-        body = all_values[-last_rows:] if len(all_values) > last_rows + 1 else all_values[1:]
-    else:
-        header = values[0]
-        body = values[1:]
+    header = all_values[0]
+    body = all_values[-last_rows:] if len(all_values) > last_rows + 1 else all_values[1:]
 
     df = pd.DataFrame(body, columns=header)
     df.columns = norm_cols(list(df.columns))
-    if len(df) > last_rows:
-        df = df.tail(last_rows)
     return df.reset_index(drop=True)
 
 
@@ -509,7 +521,8 @@ def write_event(
         status,
         obs,
     ]
-    append_row(LOGS_SHEET_ID, EVENTS_TAB, row, header_if_empty=EVENTS_HEADER)
+    ws = ensure_events_tab()
+    retryable(lambda: ws.append_row(row, value_input_option="RAW"))
     load_events_last.clear()
 
 
