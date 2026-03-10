@@ -12,8 +12,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
-APP_VERSION = "2026-03-10-v5"
-
 TZ = ZoneInfo("America/Sao_Paulo")
 
 SCOPES = [
@@ -357,8 +355,7 @@ def map_itens(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df = df.sort_values(["area_id", "turno", "texto"])
 
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
 
 
 def map_users(df: pd.DataFrame) -> pd.DataFrame:
@@ -397,13 +394,15 @@ def deduplicate_items(df: pd.DataFrame) -> pd.DataFrame:
 
     df2["texto_norm"] = df2["texto"].astype(str).str.strip().str.lower()
     df2["deadline_norm"] = df2["deadline_hhmm"].astype(str).str.strip()
-    df2["dia_norm"] = df2["dia_semana"].astype(str).str.strip().apply(lambda x: "|".join(sorted(list(parse_weekday_tokens(x)))) if x else "")
+    df2["dia_norm"] = df2["dia_semana"].astype(str).str.strip().apply(
+        lambda x: "|".join(sorted(list(parse_weekday_tokens(x)))) if x else ""
+    )
     df2["area_norm"] = df2["area_id"].astype(str).str.strip()
     df2["turno_norm"] = df2["turno"].astype(str).str.strip()
 
     df2 = df2.drop_duplicates(
         subset=["area_norm", "turno_norm", "texto_norm", "deadline_norm", "dia_norm"],
-        keep="first"
+        keep="first",
     ).copy()
 
     df2 = df2.drop(columns=["texto_norm", "deadline_norm", "dia_norm", "area_norm", "turno_norm"], errors="ignore")
@@ -595,7 +594,6 @@ def authenticate(users_df: pd.DataFrame) -> Optional[Dict[str, str]]:
 
     st.title("Login")
     st.caption("Acesso protegido por usuario e senha.")
-    st.caption(f"Versao do app: {APP_VERSION}")
 
     u = st.text_input("Usuario", key="u")
     p = st.text_input("Senha", type="password", key="p")
@@ -620,29 +618,8 @@ def authenticate(users_df: pd.DataFrame) -> Optional[Dict[str, str]]:
     return None
 
 
-def render_debug_panel(cfg: Dict[str, pd.DataFrame], filtered_items: pd.DataFrame, weekday_name: str, day_iso: str):
-    itens = cfg["itens"]
-
-    st.markdown("### Diagnostico")
-    st.write("Versao:", APP_VERSION)
-    st.write("Data considerada:", day_iso)
-    st.write("Dia considerado:", weekday_name)
-    st.write("Colunas ITENS:", list(itens.columns))
-    st.write("Total de itens lidos:", len(itens))
-    st.write("Total de itens filtrados para o dia:", len(filtered_items))
-
-    if "dia_semana" in itens.columns:
-        st.write("Valores unicos brutos em dia_semana:")
-        st.write(sorted([str(x) for x in itens["dia_semana"].dropna().astype(str).unique().tolist()]))
-
-    cols_show = [c for c in ["area_id", "turno", "item_id", "texto", "deadline_hhmm", "dia_semana"] if c in filtered_items.columns]
-    if cols_show:
-        st.dataframe(filtered_items[cols_show].head(100), use_container_width=True)
-
-
 def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
     st.subheader("Dashboard operacional")
-    st.caption(f"Versao do app: {APP_VERSION}")
 
     areas = cfg["areas"]
     itens = cfg["itens"]
@@ -675,9 +652,6 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
         """,
         unsafe_allow_html=True,
     )
-    st.caption(f"Itens carregados: {len(itens)} | Itens filtrados para o dia: {len(itens_dia)}")
-
-    render_debug_panel(cfg, itens_dia, day_weekday, day_iso)
 
     turnos = sorted(itens_dia["turno"].dropna().astype(str).str.strip().unique().tolist())
 
@@ -746,7 +720,6 @@ def page_dashboard(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame):
 
 def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: Dict[str, str]):
     st.subheader("Checklist")
-    st.caption(f"Versao do app: {APP_VERSION}")
 
     areas = cfg["areas"]
     itens = cfg["itens"]
@@ -766,9 +739,6 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
         """,
         unsafe_allow_html=True,
     )
-    st.caption(f"Itens carregados: {len(itens)} | Itens filtrados para o dia: {len(itens_dia)}")
-
-    render_debug_panel(cfg, itens_dia, today_weekday, today_iso)
 
     areas_labels = [f"{r['area_nome']} ({r['area_id']})" for _, r in areas.iterrows()]
     area_sel = st.selectbox("Area", areas_labels, index=0)
@@ -889,7 +859,6 @@ def page_checklist(cfg: Dict[str, pd.DataFrame], events_df: pd.DataFrame, user: 
 
 def page_events(events_df: pd.DataFrame):
     st.subheader("EVENTS")
-    st.caption(f"Versao do app: {APP_VERSION}")
 
     if st.button("Atualizar EVENTS"):
         st.rerun()
@@ -904,7 +873,6 @@ def main():
 
     with st.sidebar:
         st.markdown("## Checklist Operacional")
-        st.caption(f"Versao: {APP_VERSION}")
 
         if st.button("Logout"):
             for k in list(st.session_state.keys()):
